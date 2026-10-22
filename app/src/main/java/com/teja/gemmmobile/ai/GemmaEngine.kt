@@ -85,7 +85,7 @@ class GemmaEngine(
         tools: List<com.google.ai.edge.litertlm.ToolProvider> = emptyList()
     ): ConversationConfig {
         val thinkBudget = if (effectiveThinking) minOf(cfg.thinkingBudget, 160) else 0
-        val maxOut = dynamicMaxOutput ?: maxOf(400, minOf(cfg.maxTokens, 1024))
+        val maxOut = dynamicMaxOutput ?: maxOf(400, minOf(cfg.maxTokens, 3072))
         val sysContent = if (!systemInstructionText.isNullOrBlank()) {
             Contents.of(Content.Text(systemInstructionText))
         } else null

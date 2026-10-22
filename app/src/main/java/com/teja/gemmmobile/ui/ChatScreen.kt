@@ -1003,7 +1003,8 @@ fun ChatScreen(
                                         onExportPdf = { text -> viewModel.generatePdfForMessage(message.id, text) },
                                         onRegenerate = onRegenerateStable,
                                         onFeedback = { feedback -> viewModel.setResponseFeedback(message.id, feedback) },
-                                        onLongPressUserMessage = onLongPressUserMessageStable
+                                        onLongPressUserMessage = onLongPressUserMessageStable,
+                                        onContinueGenerating = { id -> viewModel.continueGeneration(id) }
                                     )
                                 }
 
@@ -2210,7 +2211,8 @@ fun MessageBubble(
     onExportPdf: (String) -> Unit = {},
     onRegenerate: () -> Unit = {},
     onFeedback: (ResponseFeedback) -> Unit = {},
-    onLongPressUserMessage: (ChatMessage) -> Unit = {}
+    onLongPressUserMessage: (ChatMessage) -> Unit = {},
+    onContinueGenerating: (String) -> Unit = {}
 ) {
     val isUser = message.role == MessageRole.USER
     val context = LocalContext.current
@@ -2593,6 +2595,38 @@ fun MessageBubble(
 
                 // Action bar — only after streaming done (matching media_1791402016025.jpg)
                 if (!message.isStreaming && effectiveText.isNotEmpty()) {
+                    if (message.isCutOff) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Surface(
+                            shape = RoundedCornerShape(20.dp),
+                            color = Color(0xFF1E293B),
+                            border = BorderStroke(1.dp, Color(0xFF10A37F).copy(alpha = 0.5f)),
+                            modifier = Modifier
+                                .liquidBounceClick(scaleDown = 0.94f, alphaDown = 0.85f) {
+                                    onContinueGenerating(message.id)
+                                }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.AutoAwesome,
+                                    contentDescription = "Continue Generating",
+                                    tint = Color(0xFF10A37F),
+                                    modifier = Modifier.size(15.dp)
+                                )
+                                Text(
+                                    text = "Continue Generating / ఇంకా కొనసాగించు",
+                                    style = MaterialTheme.typography.labelMedium.copy(
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = Color(0xFFF1F5F9)
+                                    )
+                                )
+                            }
+                        }
+                    }
                     Spacer(modifier = Modifier.height(10.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),

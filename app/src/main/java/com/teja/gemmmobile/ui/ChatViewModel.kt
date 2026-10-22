@@ -76,7 +76,8 @@ data class ChatMessage(
     val generatedPdfPath: String? = null,
     val generatedPdfTitle: String? = null,
     val generatedPdfPageCount: Int = 0,
-    val isPdfDocumentRequest: Boolean = false
+    val isPdfDocumentRequest: Boolean = false,
+    val isCutOff: Boolean = false
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
@@ -722,6 +723,90 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         return false
     }
 
+    /**
+     * Detects if an assistant response was abruptly truncated / cut off mid-thought due to token budget exhaustion.
+     */
+    fun isTruncatedOrCutoff(rawText: String?): Boolean {
+        if (rawText.isNullOrBlank()) return false
+        val text = rawText.trim()
+        if (text.length < 350) return false // Short direct answers are not cutoffs
+
+        // 1. Ending with hanging hyphen or dash (e.g. "within-", "hyper-", "multi-")
+        if (text.endsWith("-") || text.endsWith("—") || text.endsWith("–")) return true
+
+        // 2. Ending with non-terminal punctuation (comma, colon, semicolon, open brackets, slashes)
+        if (text.endsWith(",") || text.endsWith(":") || text.endsWith(";") ||
+            text.endsWith("(") || text.endsWith("[") || text.endsWith("{") ||
+            text.endsWith("/") || text.endsWith("\\") || text.endsWith("&")) return true
+
+        // 3. Ending in an incomplete list item or heading (e.g. "• Metric: ", "### ")
+        val lastLine = text.lines().lastOrNull()?.trim() ?: ""
+        if (lastLine.matches(Regex("""^(?:[-*•]|\d+\.)\s*([A-Za-z0-9_]+:)?\s*$""")) ||
+            (lastLine.startsWith("#") && !lastLine.contains("\n"))) return true
+
+        // 4. Odd number of markdown code fences (unclosed code block)
+        val fenceCount = Regex("""```""").findAll(text).count()
+        if (fenceCount % 2 != 0) return true
+
+        // 5. Ending without terminal sentence punctuation
+        val lastChar = text.last()
+        val terminalPunctuation = setOf('.', '!', '?', '"', '\'', '`', '।', '’', '”', '…', ')', ']', '}')
+        if (lastChar !in terminalPunctuation) {
+            return true
+        }
+
+        return false
+    }
+
+    /**
+     * Seamlessly stitches a continuation chunk onto previous text, eliminating duplicate overlapping tokens
+     * and preserving hyphenated words and whitespace.
+     */
+    fun stitchContinuation(previousText: String, continuation: String): String {
+        val prev = previousText.trimEnd()
+        var cont = continuation.trimStart()
+
+        // Strip conversational filler prefixes emitted by the model
+        val fillerPrefixes = listOf(
+            "Continuing from where we left off:",
+            "Continuing from where I left off:",
+            "Continuing:",
+            "Sure, continuing:",
+            "Sure!",
+            "Certainly!",
+            "Here is the rest:",
+            "Here is the continuation:",
+            "Continuing the study notes:"
+        )
+        for (filler in fillerPrefixes) {
+            if (cont.startsWith(filler, ignoreCase = true)) {
+                cont = cont.substring(filler.length).trimStart()
+            }
+        }
+
+        // Check overlap of up to 40 characters between end of prev and start of cont
+        val maxOverlap = minOf(40, prev.length, cont.length)
+        for (overlapLen in maxOverlap downTo 3) {
+            val prevSuffix = prev.takeLast(overlapLen)
+            if (cont.startsWith(prevSuffix, ignoreCase = true)) {
+                cont = cont.substring(overlapLen).trimStart()
+                break
+            }
+        }
+
+        // If prev ends with a hyphen (like "within-") and cont starts with "cluster"
+        if (prev.endsWith("-") && !cont.startsWith(" ") && !cont.startsWith("\n")) {
+            return prev + cont
+        }
+
+        // If prev doesn't end with whitespace or newline and cont doesn't start with whitespace/newline
+        if (!prev.endsWith(" ") && !prev.endsWith("\n") && !cont.startsWith(" ") && !cont.startsWith("\n")) {
+            return "$prev $cont"
+        }
+
+        return prev + cont
+    }
+
     fun isFlowchartRequest(prompt: String): Boolean {
         val p = prompt.lowercase().trim()
         val keywords = listOf(
@@ -1195,8 +1280,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val baseSystemPrompt = _config.value.systemPrompt.ifBlank { GemmaConfig.DEFAULT_SYSTEM_PROMPT }
                 val allowTools = !isDocument && !hasDocInSession && imageBytes == null && searchContext.isBlank()
 
+                val lastAssistant = targetMsgs.lastOrNull { it.role == MessageRole.ASSISTANT && it.id != assistantMessageId && it.text.isNotBlank() }
                 val isContinue = isContinueRequest(prompt)
-                val isPdf = isPdfRequest(prompt) && !isDocument && imageBytes == null
+                val isPdf = (isPdfRequest(prompt) || (isContinue && lastAssistant?.isPdfDocumentRequest == true)) && !isDocument && imageBytes == null
                 val matchedSkill = if (isPdf) skillRegistry.skills.firstOrNull { it.id == "pdf-maker" } else skillRegistry.findMatchingSkill(prompt)
                 val effectiveSystemPrompt = when {
                     imageBytes != null -> "You are a helpful assistant. Directly and accurately describe what is in the image in plain language."
@@ -1259,7 +1345,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             "Output pure markdown starting with '# $cleanTopic: Complete Study Notes' on line 1, organized with clear section headings (##), detailed explanations, bullet points, comparison tables, and key takeaways."
                         }
                         isContinue -> {
-                            val lastAssistant = targetMsgs.lastOrNull { it.role == MessageRole.ASSISTANT && it.id != assistantMessageId && it.text.isNotBlank() }
                             val lastText = lastAssistant?.text?.trim() ?: ""
                             val tailSnippet = if (lastText.length > 300) lastText.takeLast(300) else lastText
                             if (tailSnippet.isNotBlank()) {
@@ -1299,8 +1384,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     prompt = effectivePrompt,
                     systemInstruction = effectiveSystemPrompt,
                     imageBytes = imageBytes,
-                    enableThinkingOverride = if (effectiveUseWebSearch || searchContext.isNotBlank()) false else null,
-                    dynamicMaxOutputOverride = if (effectiveUseWebSearch || searchContext.isNotBlank()) com.teja.gemmmobile.search.SearchConfig.MAX_WEB_OUTPUT_TOKENS else null
+                    enableThinkingOverride = if (effectiveUseWebSearch || searchContext.isNotBlank() || isPdf) false else null,
+                    dynamicMaxOutputOverride = when {
+                        effectiveUseWebSearch || searchContext.isNotBlank() -> com.teja.gemmmobile.search.SearchConfig.MAX_WEB_OUTPUT_TOKENS
+                        isPdf -> 3072
+                        else -> 2048
+                    }
                 )
                     .catch { error ->
                         Log.e(TAG, "[$TAG] Stream error", error)
@@ -1526,6 +1615,85 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
+                // Autonomous auto-continuation loop for PDF document requests
+                if (isPdf && isTruncatedOrCutoff(responseBuilder.toString())) {
+                    var autoContinuePass = 0
+                    val maxAutoContinuePasses = 2
+                    while (autoContinuePass < maxAutoContinuePasses && isTruncatedOrCutoff(responseBuilder.toString())) {
+                        autoContinuePass++
+                        Log.i(TAG, "[$TAG] Autonomous auto-continue for PDF triggered (pass $autoContinuePass)")
+                        val currentStitched = responseBuilder.toString().trim()
+                        val tailSnippet = currentStitched.takeLast(250).trim()
+
+                        updateSessionMessages(targetSessionId) { msgs ->
+                            msgs.map { msg ->
+                                if (msg.id == assistantMessageId) {
+                                    msg.copy(
+                                        toolExecutionStatus = "Completing notes (continuing section $autoContinuePass)...",
+                                        isStreaming = true
+                                    )
+                                } else msg
+                            }
+                        }
+
+                        val contPrompt = contextManager.buildPrompt(
+                            systemPrompt = effectiveSystemPrompt,
+                            conversationHistory = emptyList(),
+                            currentPrompt = "## CONTINUATION DIRECTIVE\n" +
+                                "You were generating a comprehensive study document, but generation reached token capacity and cut off at:\n" +
+                                "\"\"\"\n...$tailSnippet\n\"\"\"\n\n" +
+                                "CRITICAL INSTRUCTIONS:\n" +
+                                "1. Pick up IMMEDIATELY from that exact point. Continue seamlessly with the very next word or sentence.\n" +
+                                "2. DO NOT output conversational filler ('Sure!', 'Continuing...'). DO NOT repeat any prior text.\n" +
+                                "3. Finish all remaining topics, comparisons, and key takeaways thoroughly."
+                        )
+
+                        val contBuilder = StringBuilder()
+                        var contUiUpdate = 0L
+                        try {
+                            eng.sendMessage(
+                                prompt = contPrompt,
+                                systemInstruction = effectiveSystemPrompt,
+                                dynamicMaxOutputOverride = 2500
+                            ).collect { chunk ->
+                                val clean = chunk.text.replace("<thought>", "").replace("</thought>", "")
+                                if (clean.isNotEmpty()) {
+                                    contBuilder.append(clean)
+                                    val now = System.currentTimeMillis()
+                                    if (now - contUiUpdate >= UI_THROTTLE_MS) {
+                                        contUiUpdate = now
+                                        val stitchedPreview = stitchContinuation(currentStitched, contBuilder.toString())
+                                        val displayPreview = stripPdfDisclaimers(stitchedPreview)
+                                        if (_currentSessionId.value == targetSessionId) {
+                                            _messages.value = _messages.value.map { msg ->
+                                                if (msg.id == assistantMessageId) {
+                                                    msg.copy(
+                                                        text = displayPreview,
+                                                        isStreaming = true,
+                                                        toolExecutionStatus = "Completing notes (continuing section $autoContinuePass)..."
+                                                    )
+                                                } else msg
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "[$TAG] PDF auto-continuation pass $autoContinuePass error", t)
+                            break
+                        }
+
+                        val contText = contBuilder.toString()
+                        if (contText.isNotBlank()) {
+                            val newlyStitched = stitchContinuation(currentStitched, contText)
+                            responseBuilder.clear()
+                            responseBuilder.append(newlyStitched)
+                        } else {
+                            break
+                        }
+                    }
+                }
+
                 val finalText = responseBuilder.toString()
 
                 // Finalize assistant message and update session history once
@@ -1562,23 +1730,29 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                 if (isPdf && finalTextToDisplay.isNotBlank()) {
                     try {
+                        val markdownForPdf = if (isContinue && lastAssistant?.text?.isNotBlank() == true) {
+                            stitchContinuation(lastAssistant.text, finalTextToDisplay)
+                        } else {
+                            finalTextToDisplay
+                        }
                         val pdfResult = com.teja.gemmmobile.pdf.PdfExporter.generatePdf(
                             context = getApplication(),
-                            markdownText = finalTextToDisplay,
-                            title = null
+                            markdownText = markdownForPdf,
+                            title = lastAssistant?.generatedPdfTitle
                         )
                         autoPdfPath = pdfResult.file.absolutePath
                         autoPdfTitle = pdfResult.title
                         autoPdfPages = pdfResult.pageCount
                         Log.i(TAG, "[$TAG] Auto PDF generated successfully: $autoPdfPath with $autoPdfPages pages")
                         withContext(Dispatchers.Main) {
-                            android.widget.Toast.makeText(getApplication(), "📄 PDF Ready! Tap 'Open PDF' to view", android.widget.Toast.LENGTH_LONG).show()
+                            android.widget.Toast.makeText(getApplication(), "📄 PDF Ready! ($autoPdfPages Pages) Tap 'Open PDF' to view", android.widget.Toast.LENGTH_LONG).show()
                         }
                     } catch (e: Exception) {
                         Log.w(TAG, "[$TAG] Auto PDF generation error", e)
                     }
                 }
 
+                val cutoff = !isPdf && isTruncatedOrCutoff(finalTextToDisplay)
                 updateSessionMessages(targetSessionId) { msgs ->
                     msgs.map { msg ->
                         if (msg.id == assistantMessageId) {
@@ -1594,6 +1768,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 toolExecutionStatus = null,
                                 isPdfDocumentRequest = isPdf,
                                 isExplicitVisualRequest = isExplicitPhotoRequest || isVisualQuery,
+                                isCutOff = cutoff,
                                 generatedPdfPath = autoPdfPath,
                                 generatedPdfTitle = autoPdfTitle,
                                 generatedPdfPageCount = autoPdfPages
@@ -1890,6 +2065,148 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         dismissError()
         regenerateLastResponse()
+    }
+
+    /**
+     * Seamlessly continues generating from where the assistant message cut off, stitching the continuation
+     * directly into the existing message bubble and updating attached PDF documents.
+     */
+    fun continueGeneration(messageId: String) {
+        val eng = engine ?: run {
+            _errorMessage.value = "Engine not loaded"
+            return
+        }
+        if (_isGenerating.value) return
+
+        val targetSessionId = _currentSessionId.value
+        val sessionSnapshot = _sessions.value.find { it.id == targetSessionId } ?: return
+        val targetMsg = sessionSnapshot.messages.find { it.id == messageId } ?: return
+        if (targetMsg.role != MessageRole.ASSISTANT || targetMsg.text.isBlank()) return
+
+        val originalText = targetMsg.text.trim()
+        val tailSnippet = originalText.takeLast(250).trim()
+        val isPdf = targetMsg.isPdfDocumentRequest || targetMsg.generatedPdfPath != null
+
+        _isGenerating.value = true
+        activeGeneratingSessionId.value = targetSessionId
+
+        updateSessionMessages(targetSessionId) { msgs ->
+            msgs.map { msg ->
+                if (msg.id == messageId) {
+                    msg.copy(
+                        isStreaming = true,
+                        isCutOff = false,
+                        toolExecutionStatus = if (isPdf) "Continuing & compiling PDF..." else "Continuing generation..."
+                    )
+                } else msg
+            }
+        }
+
+        activeGenerationJob = applicationScope.launch {
+            val pm = getApplication<Application>().getSystemService(Context.POWER_SERVICE) as? PowerManager
+            val wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "GemmaMobile:ContinueGen")
+            try { wakeLock?.acquire(5 * 60 * 1000L) } catch (_: Exception) {}
+
+            try {
+                val continuePrompt = "## CONTINUATION DIRECTIVE\n" +
+                    "The previous response cut off at:\n" +
+                    "\"\"\"\n...$tailSnippet\n\"\"\"\n\n" +
+                    "CRITICAL INSTRUCTIONS:\n" +
+                    "1. Pick up IMMEDIATELY from that exact point. Continue seamlessly with the very next word or sentence.\n" +
+                    "2. DO NOT output conversational filler ('Sure!', 'Continuing...', etc.) and DO NOT repeat any prior text.\n" +
+                    "3. Finish the explanation thoroughly and conclude naturally."
+
+                val effectivePrompt = contextManager.buildPrompt(
+                    systemPrompt = GemmaConfig.DEFAULT_SYSTEM_PROMPT,
+                    conversationHistory = emptyList(),
+                    currentPrompt = continuePrompt
+                )
+
+                val continuationBuilder = StringBuilder()
+                var lastContUpdate = 0L
+                val UI_THROTTLE_MS = 100L
+
+                eng.sendMessage(
+                    prompt = effectivePrompt,
+                    dynamicMaxOutputOverride = if (isPdf) 3072 else 2048
+                ).collect { chunk ->
+                    val clean = chunk.text.replace("<thought>", "").replace("</thought>", "")
+                    if (clean.isNotEmpty()) {
+                        continuationBuilder.append(clean)
+                        val now = System.currentTimeMillis()
+                        if (now - lastContUpdate >= UI_THROTTLE_MS) {
+                            lastContUpdate = now
+                            val stitchedPreview = stitchContinuation(originalText, continuationBuilder.toString())
+                            val displayPreview = if (isPdf) stripPdfDisclaimers(stitchedPreview) else stitchedPreview
+                            if (_currentSessionId.value == targetSessionId) {
+                                _messages.value = _messages.value.map { msg ->
+                                    if (msg.id == messageId) {
+                                        msg.copy(text = displayPreview, isStreaming = true)
+                                    } else msg
+                                }
+                            }
+                        }
+                    }
+                }
+
+                val stitchedFinal = stitchContinuation(originalText, continuationBuilder.toString())
+                val resolvedFinal = if (isPdf) stripPdfDisclaimers(stitchedFinal) else stitchedFinal
+                val stillCutOff = isTruncatedOrCutoff(resolvedFinal)
+
+                var updatedPdfPath = targetMsg.generatedPdfPath
+                var updatedPdfTitle = targetMsg.generatedPdfTitle
+                var updatedPdfPages = targetMsg.generatedPdfPageCount
+
+                if (isPdf && resolvedFinal.isNotBlank()) {
+                    try {
+                        val pdfResult = com.teja.gemmmobile.pdf.PdfExporter.generatePdf(
+                            context = getApplication(),
+                            markdownText = resolvedFinal,
+                            title = updatedPdfTitle
+                        )
+                        updatedPdfPath = pdfResult.file.absolutePath
+                        updatedPdfTitle = pdfResult.title
+                        updatedPdfPages = pdfResult.pageCount
+                        withContext(Dispatchers.Main) {
+                            android.widget.Toast.makeText(getApplication(), "📄 PDF Updated with complete notes!", android.widget.Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "[$TAG] Error regenerating PDF after continuation", e)
+                    }
+                }
+
+                updateSessionMessages(targetSessionId) { msgs ->
+                    msgs.map { msg ->
+                        if (msg.id == messageId) {
+                            msg.copy(
+                                text = resolvedFinal,
+                                isStreaming = false,
+                                isCutOff = stillCutOff,
+                                toolExecutionStatus = null,
+                                generatedPdfPath = updatedPdfPath,
+                                generatedPdfTitle = updatedPdfTitle,
+                                generatedPdfPageCount = updatedPdfPages
+                            )
+                        } else msg
+                    }
+                }
+
+                _sessions.value.find { it.id == targetSessionId }?.let { chatStorage.saveSession(it) }
+            } catch (t: Throwable) {
+                Log.e(TAG, "[$TAG] Error during continueGeneration", t)
+                updateSessionMessages(targetSessionId) { msgs ->
+                    msgs.map { msg ->
+                        if (msg.id == messageId) {
+                            msg.copy(isStreaming = false, toolExecutionStatus = null)
+                        } else msg
+                    }
+                }
+            } finally {
+                _isGenerating.value = false
+                activeGeneratingSessionId.value = null
+                try { wakeLock?.release() } catch (_: Exception) {}
+            }
+        }
     }
 
     fun generatePdfForMessage(messageId: String, text: String, title: String? = null) {

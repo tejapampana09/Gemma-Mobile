@@ -13,7 +13,7 @@ enum class PreferredBackend(val displayName: String) {
  */
 data class GemmaConfig(
     val temperature: Float = 0.65f,
-    val maxTokens: Int = 1200,
+    val maxTokens: Int = 2048,
     val topP: Float = 0.90f,
     val topK: Int = 40,
     val enableThinking: Boolean = false,
