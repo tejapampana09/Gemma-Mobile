@@ -112,7 +112,7 @@ object ProfileAvatarLoader {
                 avatarCache.put(url, fallbackFavicon)
                 return@withContext fallbackFavicon
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.d(TAG, "[$TAG] Could not load avatar for $url: ${e.message}")
         }
 
@@ -178,10 +178,10 @@ object ProfileAvatarLoader {
                     return m2.group(1)?.trim()
                 }
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             // Ignore fetch errors
         } finally {
-            try { conn?.disconnect() } catch (_: Exception) {}
+            try { conn?.disconnect() } catch (_: Throwable) {}
         }
         return null
     }
@@ -270,10 +270,10 @@ object ProfileAvatarLoader {
                 System.gc()
                 null
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             // Ignore download and parse errors
         } finally {
-            try { conn?.disconnect() } catch (_: Exception) {}
+            try { conn?.disconnect() } catch (_: Throwable) {}
         }
         return null
     }

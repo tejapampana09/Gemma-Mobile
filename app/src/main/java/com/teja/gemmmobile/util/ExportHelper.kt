@@ -62,6 +62,23 @@ object ExportHelper {
         context.startActivity(shareIntent)
     }
 
+    fun exportMessageAsPdf(
+        context: Context,
+        text: String,
+        title: String? = null,
+        coroutineScope: kotlinx.coroutines.CoroutineScope
+    ) {
+        com.teja.gemmmobile.pdf.PdfExporter.exportAndShare(context, text, title, coroutineScope)
+    }
+
+    fun exportSessionAsPdf(
+        context: Context,
+        session: ChatSession,
+        coroutineScope: kotlinx.coroutines.CoroutineScope
+    ) {
+        com.teja.gemmmobile.pdf.PdfExporter.exportSessionAndShare(context, session, coroutineScope)
+    }
+
     fun addToCalendar(context: Context, title: String, description: String) {
         try {
             val intent = Intent(Intent.ACTION_INSERT).apply {

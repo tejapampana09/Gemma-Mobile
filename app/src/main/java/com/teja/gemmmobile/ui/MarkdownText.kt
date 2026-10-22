@@ -39,6 +39,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.ClickableText
+import androidx.compose.foundation.text.InlineTextContent
+import androidx.compose.foundation.text.appendInlineContent
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.Placeholder
+import androidx.compose.ui.text.PlaceholderVerticalAlign
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.material3.Surface
@@ -1720,6 +1727,68 @@ fun highlightCodeSyntax(code: String, language: String): AnnotatedString {
 /**
  * Clickable markdown text line that intercepts tapped URLs and opens them via LocalUriHandler.
  */
+/**
+ * Calculates physical layout width for ChatGPT stadium citation capsule.
+ */
+fun calculateCitationPillWidth(brand: String, extraCount: Int): androidx.compose.ui.unit.TextUnit {
+    val charWidth = 6.6
+    val base = 12.0 + 4.5 + 18.0 + (brand.length * charWidth)
+    val extra = if (extraCount > 0) 18.0 else 0.0
+    return (base + extra).sp
+}
+
+/**
+ * ChatGPT-style inline citation capsule pill.
+ * Renders a sleek stadium pill: [ (Favicon) Brand +Count ]
+ * Zero square backgrounds, zero arrows.
+ */
+@Composable
+fun CitationCapsule(
+    url: String,
+    brand: String,
+    extraCount: Int = 0,
+    onClick: () -> Unit = {}
+) {
+    Surface(
+        shape = RoundedCornerShape(percent = 50),
+        color = Color(0xFF2C2C2E),
+        border = BorderStroke(0.6.dp, Color(0xFF3E3E42)),
+        modifier = Modifier
+            .clip(RoundedCornerShape(percent = 50))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 2.dp)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.5.dp)
+        ) {
+            DomainFaviconBadge(
+                url = url,
+                size = 12.dp
+            )
+            Text(
+                text = brand,
+                color = Color(0xFFD1D1D6),
+                fontSize = 11.5.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1
+            )
+            if (extraCount > 0) {
+                Text(
+                    text = "+$extraCount",
+                    color = Color(0xFF8E8E93),
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Clickable markdown text line that intercepts tapped URLs and opens them via LocalUriHandler.
+ */
 @Composable
 fun ClickableMarkdownLine(
     annotatedText: AnnotatedString,
@@ -1727,18 +1796,88 @@ fun ClickableMarkdownLine(
     modifier: Modifier = Modifier
 ) {
     val uriHandler = LocalUriHandler.current
+    var layoutResult by remember { mutableStateOf<TextLayoutResult?>(null) }
 
-    ClickableText(
+    val inlineContentMap = remember(annotatedText) {
+        val citeAnnotations = annotatedText.getStringAnnotations(tag = "CITATION_CAPSULE", start = 0, end = annotatedText.length)
+        val favAnnotations = annotatedText.getStringAnnotations(tag = "FAVICON_URL", start = 0, end = annotatedText.length)
+
+        val map = mutableMapOf<String, InlineTextContent>()
+
+        for (ann in citeAnnotations) {
+            val parts = ann.item.split("|")
+            val id = parts.getOrElse(0) { "" }
+            val favUrl = parts.getOrElse(1) { "" }
+            val brand = parts.getOrElse(2) { "Source" }
+            val extraCount = parts.getOrElse(3) { "0" }.toIntOrNull() ?: 0
+
+            if (id.isNotBlank()) {
+                map[id] = InlineTextContent(
+                    Placeholder(
+                        width = calculateCitationPillWidth(brand, extraCount),
+                        height = 20.sp,
+                        placeholderVerticalAlign = PlaceholderVerticalAlign.Center
+                    )
+                ) { _ ->
+                    CitationCapsule(
+                        url = favUrl,
+                        brand = brand,
+                        extraCount = extraCount,
+                        onClick = {
+                            try {
+                                uriHandler.openUri(favUrl)
+                            } catch (_: Exception) {}
+                        }
+                    )
+                }
+            }
+        }
+
+        for (ann in favAnnotations) {
+            val parts = ann.item.split("|", limit = 2)
+            val id = parts.getOrElse(0) { "" }
+            val favUrl = parts.getOrElse(1) { "" }
+            if (id.isNotBlank() && !map.containsKey(id)) {
+                map[id] = InlineTextContent(
+                    Placeholder(
+                        width = 13.5.sp,
+                        height = 13.5.sp,
+                        placeholderVerticalAlign = PlaceholderVerticalAlign.Center
+                    )
+                ) { _ ->
+                    DomainFaviconBadge(
+                        url = favUrl,
+                        size = 12.dp
+                    )
+                }
+            }
+        }
+
+        map
+    }
+
+    Text(
         text = annotatedText,
         style = style,
-        modifier = modifier,
-        onClick = { offset ->
-            annotatedText.getStringAnnotations(tag = "URL", start = offset, end = offset)
-                .firstOrNull()?.let { annotation ->
-                    try {
-                        uriHandler.openUri(annotation.item)
-                    } catch (_: Exception) {}
+        inlineContent = inlineContentMap,
+        onTextLayout = { layoutResult = it },
+        modifier = modifier.pointerInput(annotatedText) {
+            detectTapGestures { pos ->
+                layoutResult?.let { layout ->
+                    val offset = layout.getOffsetForPosition(pos)
+                    val annotation = annotatedText.getStringAnnotations(tag = "URL", start = offset, end = offset).firstOrNull()
+                        ?: (if (offset > 0) annotatedText.getStringAnnotations(tag = "URL", start = offset - 1, end = offset - 1).firstOrNull() else null)
+                        ?: (if (offset + 1 < annotatedText.length) annotatedText.getStringAnnotations(tag = "URL", start = offset + 1, end = offset + 1).firstOrNull() else null)
+                        ?: (if (offset > 1) annotatedText.getStringAnnotations(tag = "URL", start = offset - 2, end = offset - 2).firstOrNull() else null)
+                        ?: (if (offset + 2 < annotatedText.length) annotatedText.getStringAnnotations(tag = "URL", start = offset + 2, end = offset + 2).firstOrNull() else null)
+
+                    annotation?.let { ann ->
+                        try {
+                            uriHandler.openUri(ann.item)
+                        } catch (_: Exception) {}
+                    }
                 }
+            }
         }
     )
 }
@@ -1756,6 +1895,9 @@ fun getSourceBrand(url: String, title: String): Pair<String, String> {
     val isFacebook = host.contains("facebook") || host.contains("fb.com")
     val isInstagram = host.contains("instagram")
     val isSrm = host.contains("srm") || title.contains("srm", ignoreCase = true)
+    val isAmazon = host.contains("amazon")
+    val isFlipkart = host.contains("flipkart")
+    val isReddit = host.contains("reddit")
 
     val brand = when {
         isLinkedIn -> "LinkedIn"
@@ -1766,10 +1908,58 @@ fun getSourceBrand(url: String, title: String): Pair<String, String> {
         isFacebook -> "Facebook"
         isInstagram -> "Instagram"
         isSrm -> "SRM University"
+        isAmazon -> "Amazon"
+        isFlipkart -> "Flipkart"
+        isReddit -> "Reddit"
         host.isNotBlank() -> host.substringBefore(".").replaceFirstChar { it.uppercase() }
         else -> "Source"
     }
     return brand to url
+}
+
+/**
+ * Resolves a clean website citation label (e.g., 'in.linkedin.com', 'srmap.edu.in', 'wikipedia.org')
+ * for rendering sleek ChatGPT-style inline website citation badges.
+ */
+fun getWebsiteCitationLabel(url: String, fallbackTitle: String = ""): String {
+    val host = try {
+        val uri = java.net.URI(url)
+        val h = uri.host ?: ""
+        if (h.startsWith("www.")) h.substring(4) else h
+    } catch (_: Exception) { "" }
+
+    if (host.isNotBlank()) {
+        return host.lowercase()
+    }
+    val (brand, _) = getSourceBrand(url, fallbackTitle)
+    return brand.ifBlank { "source" }
+}
+
+
+/**
+ * Resolves a clean website brand glyph / icon for inline ChatGPT-style citation pills.
+ */
+fun getWebsiteIcon(url: String, fallbackTitle: String = ""): String {
+    val host = try {
+        java.net.URI(url).host?.removePrefix("www.")?.lowercase() ?: ""
+    } catch (_: Exception) { "" }
+    val title = fallbackTitle.lowercase()
+
+    return when {
+        host.contains("linkedin") || title.contains("linkedin") -> "🔗 "
+        host.contains("github") || title.contains("github") -> "🐙 "
+        host.contains("wikipedia") || title.contains("wikipedia") -> "📖 "
+        host.contains("twitter") || host.contains("x.com") -> "𝕏 "
+        host.contains("youtube") || host.contains("youtu.be") -> "▶️ "
+        host.contains("facebook") || host.contains("fb.com") -> "📘 "
+        host.contains("instagram") -> "📸 "
+        host.contains("reddit") -> "💬 "
+        host.contains("srm") || host.contains("edu") || host.contains("ac.in") -> "🎓 "
+        host.contains("gov") || host.contains("nic.in") -> "🏛️ "
+        host.contains("amazon") || host.contains("flipkart") || host.contains("myntra") -> "🛍️ "
+        host.contains("hindu") || host.contains("ndtv") || host.contains("times") || host.contains("bbc") || host.contains("news") -> "📰 "
+        else -> "🌐 "
+    }
 }
 
 /**
@@ -1825,8 +2015,17 @@ fun sanitizeMarkdown(input: String, searchResults: List<SearchResult> = emptyLis
         }
     }
 
-    // 4. Map numeric citation references like [1], [2], [1, 2] to sleek clickable citation pills
+    // 4. Map numeric & named citation references to sleek clickable citation pills
     if (searchResults.isNotEmpty()) {
+        // 4a. Normalize unicode brackets, e.g. 【1】 -> [1]
+        s = s.replace(Regex("""【([0-9]+(?:\s*,\s*[0-9]+)*)】""")) { "[${it.groupValues[1]}]" }
+        s = s.replace(Regex("""〔([0-9]+(?:\s*,\s*[0-9]+)*)〕""")) { "[${it.groupValues[1]}]" }
+        // 4b. Normalize [Source 1], [Ref 1], [Result 1] -> [1]
+        s = s.replace(Regex("""\[(?:source|ref|result)\s*[:#]?\s*([0-9]+)\]""", RegexOption.IGNORE_CASE)) { "[${it.groupValues[1]}]" }
+        // 4c. Normalize (1), (2) at sentence ends or before punctuation
+        s = s.replace(Regex("""(?<=\w)\s*\(([1-9])\)(?=\s*[.,\n]|$)""")) { " [${it.groupValues[1]}]" }
+
+        // 4d. Map numeric citation references like [1], [2], [1, 2] to individual sleek website citation pills
         val numCitationRegex = Regex("""\[([0-9]+(?:\s*,\s*[0-9]+)*)\]""")
         s = s.replace(numCitationRegex) { match ->
             val numStr = match.groupValues[1].trim()
@@ -1834,21 +2033,40 @@ fun sanitizeMarkdown(input: String, searchResults: List<SearchResult> = emptyLis
             if (indices.isEmpty()) {
                 match.value
             } else {
-                val validResults = indices.mapNotNull { idx -> searchResults.getOrNull(idx - 1) }
-                if (validResults.isEmpty()) {
-                    match.value
-                } else {
-                    val first = validResults[0]
-                    "[$numStr](${first.url})"
-                }
+                val primaryIdx = indices.first()
+                val res = searchResults.getOrNull(primaryIdx - 1)
+                if (res != null) {
+                    val (brand, _) = getSourceBrand(res.url, res.title)
+                    val extraCount = indices.size - 1
+                    "[citation:$brand:$extraCount](${res.url})"
+                } else match.value
             }
+        }
+
+        // 4e. Ground bare domain citations in brackets, e.g. [in.linkedin.com] -> [citation:LinkedIn:0](url)
+        for (res in searchResults) {
+            val (brand, _) = getSourceBrand(res.url, res.title)
+            val label = getWebsiteCitationLabel(res.url, res.title)
+            val bareRegex = Regex("""\[${Regex.escape(label)}\](?!\()""", RegexOption.IGNORE_CASE)
+            s = s.replace(bareRegex, "[citation:$brand:0](${res.url})")
+            val rootDomain = label.substringAfter(".")
+            if (rootDomain.contains(".")) {
+                val bareRoot = Regex("""\[${Regex.escape(rootDomain)}\](?!\()""", RegexOption.IGNORE_CASE)
+                s = s.replace(bareRoot, "[citation:$brand:0](${res.url})")
+            }
+            val bareBrand = Regex("""\[${Regex.escape(brand)}\](?!\()""", RegexOption.IGNORE_CASE)
+            s = s.replace(bareBrand, "[citation:$brand:0](${res.url})")
         }
 
         // 5. Ground markdown links [Title](url) to real URLs from searchResults to prevent random/hallucinated domains
         val markdownLinkRegex = Regex("""\[([^\]]+)\]\((https?://[^\s)]+)\)""")
         s = s.replace(markdownLinkRegex) { match ->
-            val linkText = match.groupValues[1]
-            val generatedUrl = match.groupValues[2]
+            val linkText = match.groupValues[1].trim()
+            val generatedUrl = match.groupValues[2].trim()
+
+            if (linkText.startsWith("citation:")) {
+                return@replace match.value
+            }
 
             val matchedResult = searchResults.firstOrNull { res ->
                 val resHost = try { java.net.URI(res.url).host?.removePrefix("www.")?.lowercase() } catch (_: Exception) { null }
@@ -1861,13 +2079,25 @@ fun sanitizeMarkdown(input: String, searchResults: List<SearchResult> = emptyLis
                 (linkText.contains("wikipedia", ignoreCase = true) && res.url.contains("wikipedia", ignoreCase = true))
             }
 
-            if (matchedResult != null) {
-                "[$linkText](${matchedResult.url})"
-            } else if (searchResults.isNotEmpty()) {
-                // If Gemma hallucinated a random domain, ground it to the primary verified result URL
-                "[$linkText](${searchResults.first().url})"
+            val targetRes = matchedResult ?: searchResults.firstOrNull()
+            val targetUrl = targetRes?.url ?: generatedUrl
+            val (brand, _) = if (targetRes != null) getSourceBrand(targetRes.url, targetRes.title) else getSourceBrand(targetUrl, linkText)
+
+            val isDomainOrCitation = linkText.matches(Regex("""^\[?\d+\]?$""")) ||
+                    linkText.contains(".") ||
+                    linkText.contains("/") ||
+                    linkText.equals("source", ignoreCase = true) ||
+                    linkText.equals("link", ignoreCase = true) ||
+                    linkText.equals("reference", ignoreCase = true) ||
+                    linkText.equals("profile", ignoreCase = true) ||
+                    linkText.equals(brand, ignoreCase = true) ||
+                    linkText.contains(brand, ignoreCase = true) ||
+                    (targetRes != null && linkText.length <= 25)
+
+            if (isDomainOrCitation && searchResults.isNotEmpty()) {
+                "[citation:$brand:0]($targetUrl)"
             } else {
-                match.value
+                "[$linkText]($targetUrl)"
             }
         }
 
@@ -1881,6 +2111,43 @@ fun sanitizeMarkdown(input: String, searchResults: List<SearchResult> = emptyLis
                 resHost != null && rawHost != null && (resHost.contains(rawHost) || rawHost.contains(resHost))
             }
             matched?.url ?: (if (searchResults.isNotEmpty()) searchResults.first().url else rawUrl)
+        }
+
+        // 7. Fallback Auto-Grounding: If model generated factual text without citations, auto-ground each paragraph/sentence with verified website citation pills
+        val hasAnyCitations = s.contains(Regex("""\[[^\]]+\]\(https?://"""))
+        if (!hasAnyCitations && searchResults.isNotEmpty() && !s.contains(":::product", ignoreCase = true)) {
+            val lines = s.lines()
+            val newLines = mutableListOf<String>()
+            var citationIdx = 0
+
+            for (line in lines) {
+                val trimmed = line.trim()
+                if (trimmed.isEmpty() || trimmed.startsWith("#") || trimmed.startsWith("```") || trimmed.startsWith("|")) {
+                    newLines.add(line)
+                    continue
+                }
+
+                // Check keyword matching with search results
+                val matchedRes = searchResults.withIndex().firstOrNull { (_, res) ->
+                    val host = try { java.net.URI(res.url).host?.removePrefix("www.")?.substringBefore(".") ?: "" } catch (_: Exception) { "" }
+                    (host.length >= 3 && trimmed.contains(host, ignoreCase = true)) ||
+                    (res.title.length >= 5 && trimmed.contains(res.title.substringBefore(" ").take(10), ignoreCase = true))
+                }
+
+                val targetIdx = matchedRes?.index ?: (citationIdx % searchResults.size)
+                citationIdx++
+                val res = searchResults[targetIdx]
+                val (brand, _) = getSourceBrand(res.url, res.title)
+                val citationPill = " [citation:$brand:0](${res.url})"
+
+                val updatedLine = if (trimmed.endsWith(".")) {
+                    trimmed.dropLast(1).trimEnd() + citationPill + "."
+                } else {
+                    trimmed + citationPill
+                }
+                newLines.add(updatedLine)
+            }
+            s = newLines.joinToString("\n")
         }
     }
 
@@ -1911,38 +2178,39 @@ fun buildInlineMarkdown(
                         val rawTitle = text.substring(i + 1, closeBracket).trim()
                         val url = text.substring(closeBracket + 2, closeParen).trim()
                         if (url.startsWith("http://") || url.startsWith("https://")) {
-                            val isNumericCitation = rawTitle.matches(Regex("""^\[?\d+(?:\s*,\s*\d+)*\]?$"""))
+                            if (rawTitle.startsWith("citation:")) {
+                                // Sleek ChatGPT-style inline stadium citation capsule: [ (Favicon) Brand +Count ]
+                                val clean = rawTitle.removePrefix("citation:")
+                                val parts = clean.split(":")
+                                val brand = parts.getOrNull(0)?.ifBlank { "Source" } ?: "Source"
+                                val extraCount = parts.getOrNull(1)?.toIntOrNull() ?: 0
+                                val inlineId = "cite_${i}_${java.lang.Math.abs(url.hashCode())}"
 
-                            pushStringAnnotation(tag = "URL", annotation = url)
-                            if (isNumericCitation) {
-                                // Subtle, compact numeric citation pill (ChatGPT style): e.g. [1]
-                                val cleanNum = rawTitle.trim('[', ']')
-                                withStyle(
-                                    SpanStyle(
-                                        color = linkColor,
-                                        fontSize = 10.5.sp,
-                                        fontWeight = FontWeight.SemiBold,
-                                        background = Color(0xFF222226)
-                                    )
-                                ) {
-                                    append(" $cleanNum ")
-                                }
+                                pushStringAnnotation(tag = "CITATION_CAPSULE", annotation = "$inlineId|$url|$brand|$extraCount")
+                                pushStringAnnotation(tag = "URL", annotation = url)
+                                append(" ")
+                                appendInlineContent(id = inlineId, alternateText = "[$brand]")
+                                pop()
+                                pop()
+                                i = closeParen + 1
+                                continue
                             } else {
-                                // Clean, elegant link text with ↗ arrow (matching ChatGPT)
+                                // Standard descriptive Markdown link: [Title — Details](url) -> clean underlined link
+                                pushStringAnnotation(tag = "URL", annotation = url)
                                 withStyle(
                                     SpanStyle(
-                                        color = linkColor,
-                                        fontWeight = FontWeight.Medium,
-                                        textDecoration = TextDecoration.Underline
+                                        color = Color(0xFFECECEC),
+                                        textDecoration = TextDecoration.Underline,
+                                        fontWeight = FontWeight.Medium
                                     )
                                 ) {
-                                    val displayTitle = if (rawTitle.isBlank()) "Link" else rawTitle.removeSuffix("↗").trim()
-                                    append("$displayTitle ↗")
+                                    val display = if (rawTitle.isBlank()) "Source" else rawTitle.removeSuffix("↗").trim()
+                                    append(display)
                                 }
+                                pop()
+                                i = closeParen + 1
+                                continue
                             }
-                            pop()
-                            i = closeParen + 1
-                            continue
                         }
                     }
                 }
@@ -1961,7 +2229,7 @@ fun buildInlineMarkdown(
                 }
                 if (url.isNotBlank()) {
                     val host = try { java.net.URI(url).host?.removePrefix("www.") } catch (_: Exception) { null }
-                    val displayUrl = if (!host.isNullOrBlank() && !host.equals("open link", ignoreCase = true)) "$host ↗" else "Link ↗"
+                    val displayUrl = if (!host.isNullOrBlank() && !host.equals("open link", ignoreCase = true)) host else "Link"
 
                     pushStringAnnotation(tag = "URL", annotation = url)
                     withStyle(

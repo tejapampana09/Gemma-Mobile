@@ -46,8 +46,20 @@ object FaviconLoader {
                 conn.requestMethod = "GET"
                 conn.setRequestProperty("User-Agent", "Mozilla/5.0")
                 if (conn.responseCode == 200) {
-                    val bytes = conn.inputStream.use { it.readBytes() }
-                    if (bytes.isNotEmpty()) {
+                    val maxBytes = 64 * 1024
+                    val buffer = java.io.ByteArrayOutputStream()
+                    val chunk = ByteArray(2048)
+                    var totalRead = 0
+                    var n: Int
+                    conn.inputStream.use { input ->
+                        while (input.read(chunk).also { n = it } != -1) {
+                            buffer.write(chunk, 0, n)
+                            totalRead += n
+                            if (totalRead > maxBytes) break
+                        }
+                    }
+                    val bytes = buffer.toByteArray()
+                    if (bytes.isNotEmpty() && totalRead <= maxBytes) {
                         val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                         if (bmp != null) {
                             cache.put(domain, bmp)
@@ -55,10 +67,10 @@ object FaviconLoader {
                         }
                     }
                 }
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
                 // fallback to next candidate
             } finally {
-                try { conn?.disconnect() } catch (_: Exception) {}
+                try { conn?.disconnect() } catch (_: Throwable) {}
             }
         }
         null

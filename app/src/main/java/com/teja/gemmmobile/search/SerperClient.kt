@@ -131,7 +131,8 @@ open class SerperClient(
                     SearchResult(
                         title = title,
                         url = link,
-                        snippet = snippet
+                        snippet = snippet,
+                        imageUrl = imageUrl
                     )
                 )
 
@@ -186,7 +187,7 @@ open class SerperClient(
             if (title.isNotBlank() && desc.isNotBlank()) {
                 val fullSnippet = if (type.isNotBlank()) "$type: $desc" else desc
                 val urlToUse = if (kgLink.isNotBlank() && seenUrls.add(kgLink)) kgLink else "https://www.google.com"
-                searchResults.add(SearchResult(title, urlToUse, fullSnippet))
+                searchResults.add(SearchResult(title, urlToUse, fullSnippet, imageUrl = imageUrl))
             }
 
             if (!imageUrl.isNullOrBlank() && imageUrl.startsWith("http")) {
@@ -227,16 +228,17 @@ open class SerperClient(
                     }
                 }
 
+                val imageUrl = obj.get("imageUrl")?.asString?.trim()
                 searchResults.add(
                     SearchResult(
                         title = title,
                         url = link,
-                        snippet = enrichedSnippet
+                        snippet = enrichedSnippet,
+                        imageUrl = if (!imageUrl.isNullOrBlank() && imageUrl.startsWith("http")) imageUrl else null
                     )
                 )
 
                 // Inline thumbnail if present
-                val imageUrl = obj.get("imageUrl")?.asString?.trim()
                 if (!imageUrl.isNullOrBlank() && imageUrl.startsWith("http")) {
                     searchImages.add(
                         SearchImage(

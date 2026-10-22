@@ -81,7 +81,8 @@ class GemmaEngine(
         cfg: GemmaConfig,
         effectiveThinking: Boolean = cfg.enableThinking,
         dynamicMaxOutput: Int? = null,
-        systemInstructionText: String? = null
+        systemInstructionText: String? = null,
+        tools: List<com.google.ai.edge.litertlm.ToolProvider> = emptyList()
     ): ConversationConfig {
         val thinkBudget = if (effectiveThinking) minOf(cfg.thinkingBudget, 160) else 0
         val maxOut = dynamicMaxOutput ?: maxOf(400, minOf(cfg.maxTokens, 1024))
@@ -90,6 +91,7 @@ class GemmaEngine(
         } else null
         return ConversationConfig(
             systemInstruction = sysContent,
+            tools = tools,
             samplerConfig = SamplerConfig(
                 topK = cfg.topK,
                 topP = cfg.topP.toDouble(),
@@ -146,24 +148,27 @@ class GemmaEngine(
             kotlinx.coroutines.delay(100)
             kotlinx.coroutines.yield()
 
-            val effectiveCacheDir = cacheDirPath ?: File(File(modelPath).parentFile ?: File("."), "litert_cache").apply { mkdirs() }.absolutePath
-            File(effectiveCacheDir).mkdirs()
+            val effectiveCacheDir = cacheDirPath?.takeIf {
+                try { File(it).mkdirs() || File(it).canWrite() } catch (_: Exception) { false }
+            } ?: run {
+                try {
+                    val localCache = File(File(modelPath).parentFile ?: File("."), "litert_cache")
+                    if (localCache.mkdirs() || localCache.canWrite()) localCache.absolutePath else null
+                } catch (_: Exception) { null }
+            } ?: System.getProperty("java.io.tmpdir") ?: "."
+
             var loadedEngine: Engine? = null
             var backendChosen = if (preferCpu) BackendType.CPU else BackendType.GPU
             var testEngine: Engine? = null
 
             if (preferCpu) {
-                // Initialize directly on CPU: Smooth, responsive, zero GPU lockups, zero phone freezing!
-                // Strictly 100% CPU: both text and vision execute on CPU threads.
+                // Initialize on CPU: Smooth, responsive, zero GPU lockups
                 var cpuEngineLoaded = false
                 try {
-                    Log.d(TAG, "[$TAG] Initializing CPU model with CPU vision backend (2 threads) and 2048 token budget...")
+                    Log.d(TAG, "[$TAG] Initializing LiteRT-LM model with standard official CPU backend...")
                     val config = EngineConfig(
                         modelPath = modelPath,
-                        backend = Backend.CPU(threadCount = 4),
-                        visionBackend = Backend.CPU(threadCount = 2),
-                        maxNumTokens = 2048,
-                        maxNumImages = 1,
+                        backend = Backend.CPU(),
                         cacheDir = effectiveCacheDir
                     )
                     testEngine = Engine(config)
@@ -171,22 +176,19 @@ class GemmaEngine(
                     loadedEngine = testEngine
                     backendChosen = BackendType.CPU
                     cpuEngineLoaded = true
-                    Log.i(TAG, "[$TAG] Model loaded successfully on CPU with CPU vision backend (2 threads)")
-                } catch (cpuVisionErr: Throwable) {
+                    Log.i(TAG, "[$TAG] Model loaded successfully on CPU with standard official config")
+                } catch (stdCpuErr: Throwable) {
                     try { testEngine?.close() } catch (_: Throwable) {}
                     testEngine = null
-                    Log.w(TAG, "[$TAG] CPU vision (2 threads) failed: ${cpuVisionErr.message}. Trying CPU vision with 4 threads...")
+                    Log.w(TAG, "[$TAG] Standard CPU config failed: ${stdCpuErr.message}. Trying CPU with explicit thread count...")
                 }
 
                 if (!cpuEngineLoaded) {
                     try {
-                        Log.d(TAG, "[$TAG] Initializing CPU model with CPU vision backend (4 threads)...")
+                        Log.d(TAG, "[$TAG] Initializing CPU model with Backend.CPU(threadCount = 4)...")
                         val config = EngineConfig(
                             modelPath = modelPath,
                             backend = Backend.CPU(threadCount = 4),
-                            visionBackend = Backend.CPU(threadCount = 4),
-                            maxNumTokens = 2048,
-                            maxNumImages = 1,
                             cacheDir = effectiveCacheDir
                         )
                         testEngine = Engine(config)
@@ -194,55 +196,32 @@ class GemmaEngine(
                         loadedEngine = testEngine
                         backendChosen = BackendType.CPU
                         cpuEngineLoaded = true
-                        Log.i(TAG, "[$TAG] Model loaded successfully on CPU with CPU vision backend (4 threads)")
-                    } catch (cpuVisionErr: Throwable) {
+                        Log.i(TAG, "[$TAG] Model loaded successfully on CPU (threadCount = 4)")
+                    } catch (t: Throwable) {
                         try { testEngine?.close() } catch (_: Throwable) {}
                         testEngine = null
-                        Log.w(TAG, "[$TAG] CPU vision failed: ${cpuVisionErr.message}. Falling back to text-only CPU...")
-                    }
-                }
-
-                if (!cpuEngineLoaded) {
-                    try {
-                        val config = EngineConfig(
-                            modelPath = modelPath,
-                            backend = Backend.CPU(threadCount = 4),
-                            maxNumTokens = 2048,
-                            cacheDir = effectiveCacheDir
-                        )
-                        testEngine = Engine(config)
-                        testEngine.initialize()
-                        loadedEngine = testEngine
-                        backendChosen = BackendType.CPU
-                        Log.i(TAG, "[$TAG] Model loaded successfully on CPU (text-only fallback)")
-                    } catch (fatal: Throwable) {
-                        try { testEngine?.close() } catch (_: Throwable) {}
-                        testEngine = null
-                        if (fatal is CancellationException) throw fatal
-                        val fatalMsg = "Failed to load model on CPU: ${fatal.localizedMessage}"
-                        Log.e(TAG, "[$TAG] $fatalMsg", fatal)
+                        if (t is CancellationException) throw t
+                        val fatalMsg = "Failed to load model on CPU: ${t.localizedMessage}"
+                        Log.e(TAG, "[$TAG] $fatalMsg", t)
                         _engineState.value = EngineState.Error(fatalMsg)
-                        return@withContext Result.failure(Exception(fatalMsg, fatal))
+                        return@withContext Result.failure(Exception(fatalMsg, t))
                     }
                 }
             } else {
-                // User explicitly selected GPU: try GPU with GPU vision
+                // User explicitly selected GPU
                 var lastGpuError: String? = null
                 try {
-                    Log.d(TAG, "[$TAG] Attempting GPU initialization with GPU vision backend...")
+                    Log.d(TAG, "[$TAG] Attempting GPU initialization with standard Backend.GPU()...")
                     val config = EngineConfig(
                         modelPath = modelPath,
                         backend = Backend.GPU(),
-                        visionBackend = Backend.GPU(),
-                        maxNumTokens = 2048,
-                        maxNumImages = 1,
                         cacheDir = effectiveCacheDir
                     )
                     testEngine = Engine(config)
                     testEngine.initialize()
                     loadedEngine = testEngine
                     backendChosen = BackendType.GPU
-                    Log.i(TAG, "[$TAG] Model loaded successfully on GPU with GPU vision")
+                    Log.i(TAG, "[$TAG] Model loaded successfully on GPU")
                 } catch (eGpu: Throwable) {
                     lastGpuError = eGpu.message ?: "GPU unsupported or out of memory"
                     Log.w(TAG, "[$TAG] GPU initialization failed: $lastGpuError. Cleaning up before CPU fallback...")
@@ -251,23 +230,20 @@ class GemmaEngine(
                     System.gc()
                     kotlinx.coroutines.delay(300)
 
-                    Log.i(TAG, "[$TAG] Falling back to CPU with 4 threads and CPU vision...")
+                    Log.i(TAG, "[$TAG] Falling back to standard CPU...")
                     _engineState.value = EngineState.Loading("Falling back to CPU...")
 
                     try {
                         val config = EngineConfig(
                             modelPath = modelPath,
-                            backend = Backend.CPU(threadCount = 4),
-                            visionBackend = Backend.CPU(threadCount = 4),
-                            maxNumTokens = 2048,
-                            maxNumImages = 1,
+                            backend = Backend.CPU(),
                             cacheDir = effectiveCacheDir
                         )
                         testEngine = Engine(config)
                         testEngine.initialize()
                         loadedEngine = testEngine
                         backendChosen = BackendType.CPU_FALLBACK
-                        Log.i(TAG, "[$TAG] Model loaded successfully on CPU fallback with CPU vision")
+                        Log.i(TAG, "[$TAG] Model loaded successfully on CPU fallback")
                     } catch (fatal: Throwable) {
                         try { testEngine?.close() } catch (_: Throwable) {}
                         testEngine = null
@@ -310,11 +286,12 @@ class GemmaEngine(
     }
 
 /**
- * Data container for streaming chunks containing text and optional thought tokens.
+ * Data container for streaming chunks containing text and optional thought tokens and tool calls.
  */
 data class EngineChunk(
     val text: String = "",
-    val thought: String = ""
+    val thought: String = "",
+    val toolCalls: List<com.google.ai.edge.litertlm.ToolCall> = emptyList()
 )
 
     /**
@@ -339,7 +316,7 @@ data class EngineChunk(
 
         val effectiveSysPrompt = systemInstruction ?: currentConfig.systemPrompt
         val sysTokens = com.teja.gemmmobile.context.ContextManager.estimateTokens(effectiveSysPrompt)
-        val maxAllowedPromptTokens = 1050
+        val maxAllowedPromptTokens = 12000
         val rawPromptTokens = com.teja.gemmmobile.context.ContextManager.estimateTokens(prompt)
         val safePrompt = if (rawPromptTokens > maxAllowedPromptTokens) {
             val allowedChars = maxAllowedPromptTokens * 2
@@ -361,8 +338,8 @@ data class EngineChunk(
         val effectiveThinking = enableThinkingOverride ?: currentConfig.enableThinking
         val effectiveThinkingBudget = if (effectiveThinking) minOf(currentConfig.thinkingBudget, 160) else 0
 
-        val totalModelMaxContext = 2048
-        val safetyMargin = 64
+        val totalModelMaxContext = 16384
+        val safetyMargin = 128
 
         try {
             var attempt = 0
@@ -386,10 +363,10 @@ data class EngineChunk(
                     availableForOutput = totalModelMaxContext - totalPromptTokens - safetyMargin
                 }
 
-                if (availableForOutput < 32) {
-                    // Graceful auto-recovery: trim base prompt to fit rather than crashing
-                    val emergencyBudget = totalModelMaxContext - currentThinkBudget - safetyMargin - 128
-                    if (emergencyBudget > 200 && totalPromptTokens > emergencyBudget) {
+                if (availableForOutput < 64) {
+                    // Graceful auto-recovery: trim base prompt to fit rather than crashing LiteRT-LM native layer
+                    val emergencyBudget = totalModelMaxContext - currentThinkBudget - safetyMargin - 200
+                    if (emergencyBudget > 150 && totalPromptTokens > emergencyBudget) {
                         Log.w(TAG, "[$TAG] Adapting prompt from $totalPromptTokens tokens to $emergencyBudget tokens to avoid context overflow")
                         val emergencyChars = emergencyBudget * 2
                         val recoveredPrompt = jniSafePrompt.takeLast(emergencyChars)
@@ -404,7 +381,7 @@ data class EngineChunk(
                 }
 
                 val requestedOutput = dynamicMaxOutputOverride ?: currentConfig.maxTokens
-                val dynamicMaxOutput = minOf(requestedOutput, availableForOutput)
+                val dynamicMaxOutput = minOf(requestedOutput, availableForOutput).coerceAtLeast(48)
                 Log.d(TAG, "[$TAG] Starting attempt $attempt with promptTokens=$totalPromptTokens, maxOutput=$dynamicMaxOutput, thinking=$currentThinking, thinkBudget=$currentThinkBudget, hasImage=${currentImageBytes != null}")
 
                 val thinkingConfig = ThinkingConfig(
@@ -438,7 +415,7 @@ data class EngineChunk(
                         // Attempt 1: send as-is (JPEG)
                         try {
                             val contents = Contents.of(
-                                Content.ImageBytes(visionBytes!!),
+                                Content.ImageBytes(visionBytes),
                                 Content.Text(jniSafePrompt)
                             )
                             visionFlow = targetConv.sendMessageAsync(contents = contents, thinkingConfig = thinkingConfig)
@@ -447,7 +424,7 @@ data class EngineChunk(
                             Log.w(TAG, "[$TAG] Vision JPEG failed: ${e1.message}. Trying PNG re-encode...")
                             // Attempt 2: re-encode to PNG
                             try {
-                                val bmp = android.graphics.BitmapFactory.decodeByteArray(visionBytes, 0, visionBytes!!.size)
+                                val bmp = android.graphics.BitmapFactory.decodeByteArray(visionBytes, 0, visionBytes.size)
                                 if (bmp != null) {
                                     val pngStream = java.io.ByteArrayOutputStream()
                                     bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, pngStream)
@@ -462,7 +439,7 @@ data class EngineChunk(
                                 } else throw IllegalStateException("Bitmap decode failed")
                             } catch (e2: Throwable) {
                                 Log.w(TAG, "[$TAG] Vision PNG also failed: ${e2.message}. Emitting error to user.")
-                                // Both formats failed — emit clear message, don't confuse model
+                                // Both formats failed - emit clear message, don't confuse model
                                 emit(EngineChunk(text = "I wasn't able to process this image. The on-device model may not support image inputs, or the image format is unsupported. Try describing what you'd like to know and I'll help with text."))
                                 succeeded = true
                                 currentImageBytes = null
@@ -482,10 +459,15 @@ data class EngineChunk(
                                 ?: message.channels["thinking"]
                                 ?: ""
                             val textContent = message.toString()
+                            val toolCalls = try {
+                                message.toolCalls
+                            } catch (_: Throwable) {
+                                emptyList()
+                            }
 
-                            if (thoughtChannel.isNotEmpty() || textContent.isNotEmpty()) {
+                            if (thoughtChannel.isNotEmpty() || textContent.isNotEmpty() || toolCalls.isNotEmpty()) {
                                 emittedAny = true
-                                emit(EngineChunk(text = textContent, thought = thoughtChannel))
+                                emit(EngineChunk(text = textContent, thought = thoughtChannel, toolCalls = toolCalls))
                             }
                         }
                     }

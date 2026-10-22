@@ -67,7 +67,8 @@ data class EnrichedSearchResult(
     fun toSearchResult(): SearchResult = SearchResult(
         title = title,
         url = url,
-        snippet = snippet
+        snippet = snippet,
+        imageUrl = imageUrl
     )
 }
 
@@ -148,25 +149,36 @@ open class SearchManager(
         val seenTitles = mutableSetOf<String>()
         val domainCounts = mutableMapOf<String, Int>()
 
+        // Check if a verified direct LinkedIn profile exists
+        val hasDirectLinkedInProfile = results.any { it.url.lowercase().contains("linkedin.com/in/") }
+
         val primaryCandidates = mutableListOf<SearchResult>()
         val overflowCandidates = mutableListOf<SearchResult>()
 
         for (res in results) {
             val normUrl = normalizeUrl(res.url)
             val normTitle = res.title.trim().lowercase()
+            val lowerUrl = normUrl.lowercase()
 
             if (normUrl.isBlank() || !webPageFetcher.isSafeUrl(normUrl)) continue
             if (normTitle.isBlank()) continue
+
+            // If a direct LinkedIn profile exists, drop LinkedIn posts or directories
+            if (hasDirectLinkedInProfile && (lowerUrl.contains("linkedin.com/posts/") || lowerUrl.contains("linkedin.com/pub/dir/") || lowerUrl.contains("linkedin.com/pulse/"))) {
+                continue
+            }
 
             // Deduplicate by URL and exact title
             if (!seenUrls.add(normUrl)) continue
             if (!seenTitles.add(normTitle)) continue
 
             val domain = extractDomain(normUrl)
+            val isLinkedInProfile = lowerUrl.contains("linkedin.com/in/")
+            val maxAllowedForDomain = if (isLinkedInProfile) 3 else 2
             val count = domainCounts.getOrDefault(domain, 0)
 
-            // Favor domain diversity: allow max 2 results from the same domain in primary selection
-            if (domain.isBlank() || count < 2) {
+            // Favor domain diversity: allow max 2 results from the same domain (or 3 for distinct LinkedIn profiles) in primary selection
+            if (domain.isBlank() || count < maxAllowedForDomain) {
                 domainCounts[domain] = count + 1
                 primaryCandidates.add(res.copy(url = normUrl))
             } else {
@@ -202,112 +214,88 @@ open class SearchManager(
             return@withContext cached.second
         }
 
-        // 1. For PRODUCTS & SHOPPING ONLY: Use Serper.dev / SerpApi for real prices, direct store links, packshots
-        // Normal web searches (isProduct == false) will NEVER touch Serper or SerpApi (0 credits used, 100% free Bing/DDG)
-        if (isProduct) {
-            // Try Serper.dev first (1,900+ credits)
-            if (serperClient.isAvailable()) {
-                try {
-                    val serperResult = serperClient.search(cleanQuery, maxResults, isProduct = true)
-                    if (serperResult != null && serperResult.results.isNotEmpty()) {
-                        Log.d(TAG, "[$TAG] Serper.dev returned ${serperResult.results.size} product results and ${serperResult.images.size} images")
-                        val enriched = serperResult.results.map { res ->
-                            EnrichedSearchResult(
-                                title = res.title,
-                                url = normalizeUrl(res.url),
-                                snippet = res.snippet,
-                                pageContent = "",
-                                fetchSucceeded = false,
-                                imageUrl = serperResult.images.firstOrNull { it.title == res.title }?.imageUrl,
-                                sourceType = ContentSourceType.SEARCH_SNIPPET
-                            )
-                        }
-                        val response = SearchResponse(
-                            status = SearchStatus.SUCCESS,
-                            results = enriched,
-                            images = serperResult.images
-                        )
-                        searchCache[cacheKey] = Pair(System.currentTimeMillis(), response)
-                        return@withContext response
-                    }
-                } catch (t: Throwable) {
-                    Log.w(TAG, "[$TAG] Serper.dev product search failed, falling back to SerpApi", t)
+        // 1. Primary Engine: Serper.dev (Google Search & Google Shopping in India)
+        var searchResultCandidate: SerpApiResult? = null
+        if (serperClient.isAvailable()) {
+            try {
+                searchResultCandidate = serperClient.search(cleanQuery, maxResults = 10, isProduct = isProduct)
+                if (searchResultCandidate != null && searchResultCandidate.results.isNotEmpty()) {
+                    Log.d(TAG, "[$TAG] Serper.dev returned ${searchResultCandidate.results.size} results and ${searchResultCandidate.images.size} images")
                 }
-            }
-
-            // Try SerpApi backup (230+ credits)
-            if (serpApiClient.isAvailable()) {
-                try {
-                    val serpResult = serpApiClient.search(cleanQuery, maxResults, isProduct = true)
-                    if (serpResult != null && serpResult.results.isNotEmpty()) {
-                        Log.d(TAG, "[$TAG] SerpApi returned ${serpResult.results.size} product results and ${serpResult.images.size} images")
-                        val enriched = serpResult.results.map { res ->
-                            EnrichedSearchResult(
-                                title = res.title,
-                                url = normalizeUrl(res.url),
-                                snippet = res.snippet,
-                                pageContent = "",
-                                fetchSucceeded = false,
-                                imageUrl = serpResult.images.firstOrNull { it.title == res.title }?.imageUrl,
-                                sourceType = ContentSourceType.SEARCH_SNIPPET
-                            )
-                        }
-                        val response = SearchResponse(
-                            status = SearchStatus.SUCCESS,
-                            results = enriched,
-                            images = serpResult.images
-                        )
-                        searchCache[cacheKey] = Pair(System.currentTimeMillis(), response)
-                        return@withContext response
-                    }
-                } catch (t: Throwable) {
-                    Log.w(TAG, "[$TAG] SerpApi product search failed, falling back to WebSearchClient", t)
-                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "[$TAG] Serper.dev search failed: ${t.localizedMessage}")
             }
         }
 
-        // 2. FOR ALL NORMAL WEB SEARCHES (isProduct == false) OR PRODUCT FALLBACK:
-        // Exclusively use 100% FREE on-device DuckDuckGo Lite, Wikipedia, and Bing!
-        // ZERO API KEYS, ZERO CREDITS, 100% FREE UNLIMITED FOREVER!
+        // 2. Secondary Engine: SerpApi (Google Search & Shopping)
+        if ((searchResultCandidate == null || searchResultCandidate.results.isEmpty()) && serpApiClient.isAvailable()) {
+            try {
+                searchResultCandidate = serpApiClient.search(cleanQuery, maxResults = 10, isProduct = isProduct)
+                if (searchResultCandidate != null && searchResultCandidate.results.isNotEmpty()) {
+                    Log.d(TAG, "[$TAG] SerpApi returned ${searchResultCandidate.results.size} results and ${searchResultCandidate.images.size} images")
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "[$TAG] SerpApi search failed: ${t.localizedMessage}")
+            }
+        }
 
-        // 3. Fallback to on-device DuckDuckGo / Wikipedia pipeline
+        // 3. Fallback: On-device WebSearchClient (DuckDuckGo Lite + Bing + Wikipedia)
         val rawResults: List<SearchResult>
-        try {
-            rawResults = webSearchClient.search(cleanQuery, maxResults = 12)
-        } catch (t: Throwable) {
-            Log.w(TAG, "[$TAG] DuckDuckGo search failed: ${t.localizedMessage}")
-            val isTimeout = t is java.net.SocketTimeoutException
-            val status = if (isTimeout) SearchStatus.TIMEOUT else SearchStatus.PROVIDER_ERROR
-            return@withContext SearchResponse(status, emptyList(), t.localizedMessage ?: "Provider error")
+        val rawImages: List<SearchImage>
+        if (searchResultCandidate != null && searchResultCandidate.results.isNotEmpty()) {
+            rawResults = searchResultCandidate.results
+            rawImages = searchResultCandidate.images
+        } else {
+            try {
+                rawResults = webSearchClient.search(cleanQuery, maxResults = 12)
+                rawImages = emptyList()
+            } catch (t: Throwable) {
+                Log.w(TAG, "[$TAG] Web search failed: ${t.localizedMessage}")
+                val isTimeout = t is java.net.SocketTimeoutException
+                val status = if (isTimeout) SearchStatus.TIMEOUT else SearchStatus.PROVIDER_ERROR
+                return@withContext SearchResponse(status, emptyList(), t.localizedMessage ?: "Provider error")
+            }
         }
 
         if (rawResults.isEmpty()) {
             return@withContext SearchResponse(SearchStatus.NO_RESULTS, emptyList())
         }
 
-        // 3. Deduplicate, filter junk/unsafe targets, and ensure domain diversity
-        val rankedResults = deduplicateAndRank(rawResults, maxResults)
+        // 4. Rank and deduplicate to ensure relevance & domain diversity
+        val rankedCandidates = webSearchClient.rankByRelevance(rawResults, cleanQuery, maxResults = 12, isProduct = isProduct)
+        val rankedResults = deduplicateAndRank(rankedCandidates, maxResults)
         if (rankedResults.isEmpty()) {
             return@withContext SearchResponse(SearchStatus.NO_RESULTS, emptyList())
         }
 
-        // 4. Concurrently fetch top public pages with bounded semaphore concurrency
+        // 5. Concurrently fetch top public pages with bounded semaphore concurrency
+        // 5. Concurrently fetch top public pages with bounded semaphore concurrency
         val semaphore = Semaphore(SearchConfig.MAX_CONCURRENT_FETCHES)
+
+        // Identify non-auth-walled public pages eligible for content scraping
+        val eligibleIndicesToFetch = mutableSetOf<Int>()
+        if (!isProduct) {
+            for ((idx, res) in rankedResults.withIndex()) {
+                val domain = extractDomain(res.url)
+                val isAuthWalledDomain = domain.contains("linkedin") || domain.contains("facebook") ||
+                    domain.contains("instagram") || domain.contains("twitter") || domain.contains("x.com") ||
+                    domain.contains("youtube") || domain.contains("reddit") || domain.contains("tiktok")
+                if (!isAuthWalledDomain && webPageFetcher.isSafeUrl(res.url)) {
+                    eligibleIndicesToFetch.add(idx)
+                    if (eligibleIndicesToFetch.size >= SearchConfig.MAX_PAGES_TO_FETCH) break
+                }
+            }
+        }
 
         val enrichedList = coroutineScope {
             val deferredEnriched = rankedResults.mapIndexed { idx, res ->
                 async {
                     var fetchedContent = ""
                     var fetchSuccess = false
-                    var fetchedImage: String? = null
+                    var fetchedImage: String? = rawImages.firstOrNull { it.title == res.title }?.imageUrl
 
-                    val domain = extractDomain(res.url)
-                    val isAuthWalledDomain = domain.contains("linkedin") || domain.contains("facebook") ||
-                        domain.contains("instagram") || domain.contains("twitter") || domain.contains("x.com") ||
-                        domain.contains("youtube") || domain.contains("reddit") || domain.contains("tiktok")
-
-                    // Skip scraping for known auth-walled social domains to prevent timeouts and bot-blockers
-                    if (idx < SearchConfig.MAX_PAGES_TO_FETCH && !isAuthWalledDomain && webPageFetcher.isSafeUrl(res.url)) {
+                    // Scrape public page content if eligible
+                    if (idx in eligibleIndicesToFetch) {
                         try {
                             semaphore.withPermit {
                                 val fetched = withTimeoutOrNull(SearchConfig.PER_PAGE_TIMEOUT_MS) {
@@ -317,7 +305,7 @@ open class SearchManager(
                                 if (fetched != null && fetched.success && fetched.content.isNotBlank() && !isAuthOrLoginText(fetched.content)) {
                                     fetchedContent = fetched.content
                                     fetchSuccess = true
-                                    fetchedImage = fetched.imageUrl
+                                    if (fetchedImage == null) fetchedImage = fetched.imageUrl
                                 }
                             }
                         } catch (t: Throwable) {
@@ -340,7 +328,13 @@ open class SearchManager(
             deferredEnriched.awaitAll()
         }
 
-        return@withContext SearchResponse(SearchStatus.SUCCESS, enrichedList)
+        val response = SearchResponse(
+            status = SearchStatus.SUCCESS,
+            results = enrichedList,
+            images = rawImages
+        )
+        searchCache[cacheKey] = Pair(System.currentTimeMillis(), response)
+        return@withContext response
     }
 
     /**
@@ -363,7 +357,8 @@ open class SearchManager(
         val wordsToStrip = setOf(
             "images", "image", "photos", "photo", "pictures", "picture", "pics", "pic",
             "wallpapers", "wallpaper", "diagrams", "diagram", "show me", "chupinchu",
-            "chudu", "bomma", "bommalu", "hd", "4k", "of"
+            "chudu", "bomma", "bommalu", "hd", "4k", "of", "search", "find", "get", "show",
+            "chey", "kavali", "chudali", "for", "please", "bro"
         )
         val tokens = q.split(Regex("""\s+""")).filter { it.lowercase() !in wordsToStrip }
         var cleaned = tokens.joinToString(" ").trim()
@@ -433,9 +428,10 @@ open class SearchManager(
 
     fun fetchBingImages(query: String, limit: Int): List<SearchImage> {
         if (query.isBlank() || limit <= 0) return emptyList()
+        var conn: HttpURLConnection? = null
         return try {
             val endpoint = URL("https://www.bing.com/images/async?q=" + URLEncoder.encode(query, "UTF-8") + "&first=0&count=25&mmasync=1")
-            val conn = (endpoint.openConnection() as HttpURLConnection).apply {
+            conn = (endpoint.openConnection() as HttpURLConnection).apply {
                 connectTimeout = SearchConfig.IMAGE_CONNECT_TIMEOUT_MS
                 readTimeout = SearchConfig.IMAGE_READ_TIMEOUT_MS
                 requestMethod = "GET"
@@ -445,17 +441,16 @@ open class SearchManager(
             }
 
             if (conn.responseCode != 200) {
-                conn.disconnect()
                 return emptyList()
             }
 
             val html = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-            conn.disconnect()
-
             parseBingImages(html, limit, query)
         } catch (e: Exception) {
             Log.w(TAG, "[$TAG] Bing image search failed for '$query', falling back to DDG", e)
             emptyList()
+        } finally {
+            try { conn?.disconnect() } catch (_: Exception) {}
         }
     }
 
@@ -476,6 +471,7 @@ open class SearchManager(
                     .replace("&gt;", ">")
                 val json = JsonParser.parseString(unescaped).asJsonObject
                 val imgUrl = json.get("murl")?.asString?.trim() ?: continue
+                val thumbUrl = json.get("turl")?.asString?.trim() ?: ""
                 val srcUrl = json.get("purl")?.asString?.trim() ?: imgUrl
                 val title = json.get("t")?.asString?.trim()
                     ?: json.get("desc")?.asString?.trim()
@@ -487,7 +483,8 @@ open class SearchManager(
                             title = title,
                             imageUrl = imgUrl,
                             sourceUrl = srcUrl,
-                            sourceDomain = extractDomain(srcUrl)
+                            sourceDomain = extractDomain(srcUrl),
+                            thumbnailUrl = thumbUrl
                         )
                     )
                 }
@@ -500,18 +497,19 @@ open class SearchManager(
 
     private fun fetchDuckDuckGoImages(query: String, limit: Int): List<SearchImage> {
         if (query.isBlank() || limit <= 0) return emptyList()
+        var conn: HttpURLConnection? = null
+        var apiConn: HttpURLConnection? = null
         try {
             val encodedQuery = URLEncoder.encode(query, "UTF-8")
             // Step 1: obtain vqd token
             val tokenUrl = "https://duckduckgo.com/?q=$encodedQuery"
-            val conn = (URL(tokenUrl).openConnection() as HttpURLConnection).apply {
+            conn = (URL(tokenUrl).openConnection() as HttpURLConnection).apply {
                 connectTimeout = SearchConfig.IMAGE_CONNECT_TIMEOUT_MS
                 readTimeout = SearchConfig.IMAGE_READ_TIMEOUT_MS
                 requestMethod = "GET"
                 setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             }
             val html = conn.inputStream.bufferedReader().use { it.readText() }
-            conn.disconnect()
 
             val vqdMatch = Regex("""vqd=["']?([0-9-]+)["']?""").find(html)
                 ?: Regex("""vqd=([0-9-]+)""").find(html)
@@ -519,7 +517,7 @@ open class SearchManager(
 
             // Step 2: Query image API endpoint
             val imgApiUrl = "https://duckduckgo.com/i.js?l=us-en&o=json&q=$encodedQuery&vqd=$vqd&f=,,,"
-            val apiConn = (URL(imgApiUrl).openConnection() as HttpURLConnection).apply {
+            apiConn = (URL(imgApiUrl).openConnection() as HttpURLConnection).apply {
                 connectTimeout = SearchConfig.IMAGE_CONNECT_TIMEOUT_MS
                 readTimeout = SearchConfig.IMAGE_READ_TIMEOUT_MS
                 requestMethod = "GET"
@@ -527,11 +525,9 @@ open class SearchManager(
                 setRequestProperty("Accept", "application/json")
             }
             if (apiConn.responseCode != 200) {
-                apiConn.disconnect()
                 return emptyList()
             }
             val jsonText = apiConn.inputStream.bufferedReader().use { it.readText() }
-            apiConn.disconnect()
 
             val jsonObject = JsonParser.parseString(jsonText).asJsonObject
             val resultsArray = jsonObject.getAsJsonArray("results") ?: return emptyList()
@@ -541,6 +537,7 @@ open class SearchManager(
                 if (ddgList.size >= limit) break
                 val obj = elem.asJsonObject
                 val imgUrl = obj.get("image")?.asString ?: continue
+                val thumbUrl = obj.get("thumbnail")?.asString?.trim() ?: ""
                 val title = obj.get("title")?.asString ?: query
                 val srcUrl = obj.get("url")?.asString ?: imgUrl
                 if (webPageFetcher.isSafeUrl(imgUrl)) {
@@ -549,7 +546,8 @@ open class SearchManager(
                             title = title,
                             imageUrl = imgUrl,
                             sourceUrl = srcUrl,
-                            sourceDomain = extractDomain(srcUrl)
+                            sourceDomain = extractDomain(srcUrl),
+                            thumbnailUrl = thumbUrl
                         )
                     )
                 }
@@ -557,6 +555,9 @@ open class SearchManager(
             return ddgList
         } catch (_: Exception) {
             return emptyList()
+        } finally {
+            try { conn?.disconnect() } catch (_: Exception) {}
+            try { apiConn?.disconnect() } catch (_: Exception) {}
         }
     }
 
@@ -578,17 +579,22 @@ open class SearchManager(
 
         for ((idx, res) in results.take(SearchConfig.DEFAULT_MAX_SEARCH_RESULTS).withIndex()) {
             val itemSb = StringBuilder()
-            val cleanTitle = res.title.take(90).replace(Regex("""[\x00-\x1F\x7F]"""), " ").trim()
-            val cleanUrl = res.url.replace(Regex("""[\x00-\x1F\x7F]"""), "").trim()
-            val cleanSnippet = res.snippet.take(280).replace(Regex("""[\x00-\x1F\x7F]"""), " ").trim()
+            val cleanTitle = res.title.take(160).replace(Regex("""[\x00-\x1F\x7F]"""), " ").trim()
+            val cleanUrl = res.url.take(300).replace(Regex("""[\x00-\x1F\x7F]"""), "").trim()
+            val cleanSnippet = res.snippet.take(800).replace(Regex("""[\x00-\x1F\x7F]"""), " ").trim()
+            val domain = extractDomain(cleanUrl).ifBlank { "source" }
 
-            itemSb.appendLine("[${idx + 1}] Title: $cleanTitle")
+            itemSb.appendLine("[${idx + 1}] [$domain] Title: $cleanTitle")
             itemSb.appendLine("Source URL: $cleanUrl")
-            itemSb.appendLine("Snippet: $cleanSnippet")
+            if (cleanUrl.contains("linkedin.com/in/")) {
+                itemSb.appendLine("Profile Summary: $cleanSnippet")
+            } else {
+                itemSb.appendLine("Snippet: $cleanSnippet")
+            }
 
             if (res.fetchSucceeded && res.pageContent.isNotBlank() && !isAuthOrLoginText(res.pageContent)) {
-                val boundedPageContent = res.pageContent.take(200).replace(Regex("""[\x00-\x1F\x7F]"""), " ").trim()
-                itemSb.appendLine("Webpage Text: $boundedPageContent")
+                val boundedPageContent = res.pageContent.take(1400).replace(Regex("""[\x00-\x1F\x7F]"""), " ").trim()
+                itemSb.appendLine("Scraped Webpage Content: $boundedPageContent")
             }
             itemSb.appendLine()
 

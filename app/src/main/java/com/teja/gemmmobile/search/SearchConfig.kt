@@ -10,7 +10,7 @@ object SearchConfig {
     const val READ_TIMEOUT_MS = 4000
     const val IMAGE_CONNECT_TIMEOUT_MS = 3000
     const val IMAGE_READ_TIMEOUT_MS = 3500
-    const val PER_PAGE_TIMEOUT_MS = 3000L
+    const val PER_PAGE_TIMEOUT_MS = 4000L
 
     // Byte and Allocation Caps (Memory Safety)
     const val MAX_PAGE_DOWNLOAD_BYTES = 512 * 1024 // 512 KB
@@ -20,15 +20,15 @@ object SearchConfig {
     const val MAX_AVATAR_DIMENSION = 200
 
     // Content Length & Concurrency Caps
-    const val MAX_PAGE_CONTENT_CHARS = 3000
+    const val MAX_PAGE_CONTENT_CHARS = 2400
     const val MAX_REDIRECTS = 3
-    const val DEFAULT_MAX_SEARCH_RESULTS = 6
-    const val MAX_PAGES_TO_FETCH = 2
-    const val MAX_CONCURRENT_FETCHES = 2
+    const val DEFAULT_MAX_SEARCH_RESULTS = 5
+    const val MAX_PAGES_TO_FETCH = 3
+    const val MAX_CONCURRENT_FETCHES = 3
 
-    // Context Window Safety (strictly bounded to fit LiteRT-LM 2048 KV-cache limit)
-    const val MAX_WEB_CONTEXT_CHARS = 900
-    const val MAX_WEB_OUTPUT_TOKENS = 650
+    // Context Window & Output Caps (Scaled for Gemma 3 32K Context)
+    const val MAX_WEB_CONTEXT_CHARS = 5000
+    const val MAX_WEB_OUTPUT_TOKENS = 2048
     const val MAX_TOOL_ARG_STRING_CHARS = 400
     const val MAX_TOOL_STEPS = 2
 
@@ -40,9 +40,10 @@ object SearchConfig {
     const val SERPAPI_COUNTRY = "in"
     const val SERPAPI_LANGUAGE = "en"
 
-    // Serper.dev Integration (1,900+ free queries, high-speed Google Search & Shopping)
-    const val SERPER_API_KEY = "af077176ca8f3640dedb5573509e74048fa50e2d"
+    // Serper.dev Integration (Disabled as requested by user to conserve credits)
+    const val SERPER_API_KEY = ""
     const val SERPER_BASE_URL = "https://google.serper.dev"
     const val SERPER_CONNECT_TIMEOUT_MS = 4000
     const val SERPER_READ_TIMEOUT_MS = 5000
 }
+

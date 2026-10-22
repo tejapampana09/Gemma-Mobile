@@ -48,6 +48,11 @@ enum class MessageRole {
     ASSISTANT
 }
 
+enum class ResponseFeedback {
+    POSITIVE,
+    NEGATIVE
+}
+
 @androidx.compose.runtime.Immutable
 data class ChatMessage(
     val id: String = UUID.randomUUID().toString(),
@@ -65,7 +70,12 @@ data class ChatMessage(
     val isExecutingTool: Boolean = false,
     val toolExecutionStatus: String? = null,
     val citedPages: List<Int> = emptyList(),
-    val sourceFileName: String? = null
+    val sourceFileName: String? = null,
+    val feedback: ResponseFeedback? = null,
+    val isExplicitVisualRequest: Boolean = false,
+    val generatedPdfPath: String? = null,
+    val generatedPdfTitle: String? = null,
+    val generatedPdfPageCount: Int = 0
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
@@ -74,11 +84,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val chatStorage = ChatStorage(application.applicationContext)
     private val searchManager = com.teja.gemmmobile.search.SearchManager()
     val memoryManager = MemoryManager(application.applicationContext)
+    val skillRegistry = com.teja.gemmmobile.skills.SkillRegistry(application.applicationContext)
     val toolRegistry = com.teja.gemmmobile.tools.ToolRegistry().apply {
         register(com.teja.gemmmobile.tools.WebSearchTool(searchManager))
         register(com.teja.gemmmobile.tools.ImageSearchTool(searchManager))
         register(com.teja.gemmmobile.tools.MemoryTool(memoryManager))
         register(com.teja.gemmmobile.tools.OcrTool(application.applicationContext))
+        register(skillRegistry.deviceIntentsTool)
+        register(skillRegistry.qrCodeTool)
+        register(skillRegistry.wikipediaTool)
     }
     val contextManager = com.teja.gemmmobile.context.ContextManager()
     private val engine: GemmaEngine? get() = GemmaRepository.getEngine()
@@ -419,57 +433,63 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun isProductQuery(prompt: String): Boolean {
-        val p = prompt.lowercase()
-        val keywords = listOf(
-            "suggest", "recommend", "best phone", "best mobile", "best laptop", "best sunscreen",
-            "phone under", "mobile under", "laptop under", "under 10000", "under 15000", "under 20000",
-            "under 25000", "under 30000", "under 40000", "under 50000", "under 500", "under 1000",
-            "budget phone", "budget mobile", "budget sunscreen", "which phone", "which mobile",
-            "which laptop", "manchi phone", "manchi mobile", "product links", "buy links",
-            "sunscreen", "mobile", "phone", "laptop", "gadget", "tablet", "earbuds", "headphones",
-            "cream", "lotion", "serum", "cleanser", "moisturizer", "spf"
+    fun isPersonQuery(prompt: String): Boolean {
+        val p = prompt.lowercase().trim()
+        if (isProductQuery(p) || isFlowchartRequest(p) || isContinueRequest(p)) return false
+
+        // 1. Direct biographical intent keywords in English and Telugu
+        val personKeywords = listOf(
+            "who is ", "who was ", "who are ", "who were ",
+            "tell me about ", "details of ", "profile of ", "bio of ",
+            "biography of ", "background of ", "career of ",
+            "evaru", "evaroo", "gurinchi cheppu", "gurinchi telupu",
+            "gurinchi vivarinchu", "evaro cheppu", "evaro telupu",
+            "linkedin", "profile", "founder of", "ceo of", "cto of",
+            "director of", "president of", "minister of", "author of",
+            "actor", "actress", "politician", "scientist", "cricketer", "player"
         )
-        return keywords.any { p.contains(it) }
+        if (personKeywords.any { p.contains(it) }) return true
+
+        // 2. Name patterns: 2-4 capitalized words in raw prompt
+        val words = prompt.trim().split(Regex("""\s+"""))
+        if (words.size in 2..4 && words.all { it.isNotEmpty() && it[0].isUpperCase() }) {
+            val nonPersonWords = setOf("How", "Why", "What", "When", "Where", "Which", "Can", "Could", "Would", "Should", "Is", "Are", "The", "Best", "Top", "Android", "Google", "Apple", "Microsoft", "Amazon", "Samsung")
+            if (words.none { it in nonPersonWords }) {
+                return true
+            }
+        }
+        return false
     }
 
-    private fun extractContextTopic(history: List<ChatMessage>): String {
-        val relevantMsgs = history.takeLast(4).reversed()
-        val candidateWords = mutableListOf<String>()
-        val productTerms = listOf(
-            "sunscreen", "spf", "skin", "acne", "moisturizer", "serum", "cleanser",
-            "phone", "mobile", "laptop", "earbuds", "tablet", "watch", "camera",
-            "budget", "combination skin", "oily skin", "dry skin", "sensitive skin"
+    fun isProductQuery(prompt: String): Boolean {
+        val p = prompt.lowercase().trim()
+        val shoppingPhrases = listOf(
+            "buy online", "buy in india", "shopping", "where to buy",
+            "price in india", "under 10000", "under 15000", "under 20000",
+            "under 25000", "under 30000", "under 40000", "under 50000"
         )
-
-        for (msg in relevantMsgs) {
-            val lower = msg.text.lowercase()
-            for (term in productTerms) {
-                if (lower.contains(term) && !candidateWords.contains(term)) {
-                    candidateWords.add(term)
-                }
-            }
-            if (candidateWords.size >= 3) break
-        }
-
-        return candidateWords.joinToString(" ")
+        return shoppingPhrases.any { p.contains(it) }
     }
 
     private fun resolveSearchQuery(raw: String, history: List<ChatMessage>): String {
-        val sanitized = searchManager.sanitizeQuery(raw)
-        if (!searchManager.isGenericQuery(sanitized) && sanitized.split(" ").size >= 2) {
-            return sanitized
-        }
-        val topic = extractContextTopic(history)
-        return if (topic.isNotBlank()) {
-            if (sanitized.isNotBlank() && !searchManager.isGenericQuery(sanitized)) {
-                "$topic $sanitized"
-            } else {
-                "$topic best buy links india"
+        var q = raw.trim()
+        val removePrefixes = listOf(
+            "can you please search the web for ", "can you please search web for ",
+            "can you search the web for ", "can you search web for ",
+            "please search the web for ", "please search web for ",
+            "search the web for ", "search the web and ", "search the web ",
+            "search web for ", "search web and ", "search web ",
+            "search for ", "search ", "browse for ", "browse ",
+            "google for ", "google ", "look up for ", "look up ",
+            "web search chesi ", "net lo chusi "
+        )
+        for (p in removePrefixes) {
+            if (q.startsWith(p, ignoreCase = true)) {
+                q = q.substring(p.length).trim()
+                break
             }
-        } else {
-            sanitized.ifBlank { raw.trim() }
         }
+        return q.ifBlank { raw.trim() }
     }
 
     fun isRefusalToBrowse(text: String): Boolean {
@@ -489,6 +509,27 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                lower.contains("internet access ledu") ||
                lower.contains("live search cheyalenu") ||
                lower.contains("real-time samacharam ledu")
+    }
+
+    fun isRefusalToSearchImages(text: String): Boolean {
+        val lower = text.lowercase()
+        return lower.contains("cannot display images") ||
+               lower.contains("can't display images") ||
+               lower.contains("cannot show images") ||
+               lower.contains("can't show images") ||
+               lower.contains("cannot generate images") ||
+               lower.contains("can't generate images") ||
+               lower.contains("text-based ai") ||
+               lower.contains("text-based model") ||
+               lower.contains("cannot search images") ||
+               lower.contains("can't search images") ||
+               lower.contains("cannot view photos") ||
+               lower.contains("cannot view images") ||
+               lower.contains("unable to show photos") ||
+               lower.contains("unable to show images") ||
+               lower.contains("bommalu chupinchalenu") ||
+               lower.contains("photos chupinchalenu") ||
+               lower.contains("image chupinchalenu")
     }
 
     private fun extractSearchQuery(raw: String): String {
@@ -555,18 +596,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun isContinueRequest(prompt: String): Boolean {
-        val p = prompt.lowercase().trim()
-        return p == "continue" ||
-               p == "continue generating" ||
-               p == "continue from where you left off" ||
-               p.startsWith("continue from where") ||
-               p.startsWith("continue generating") ||
-               p == "continue response" ||
-               p == "go on" ||
-               p == "keep going" ||
-               p == "continue please" ||
-               p == "inka cheppu" ||
-               p == "continue cheyyi"
+        val p = prompt.lowercase().trim().trimEnd('.', '!', '?', ',', ' ', ';')
+        val exactMatches = setOf(
+            "continue", "cont", "continue generating", "go on", "keep going",
+            "more", "tell me more", "inka", "inka cheppu", "inka rayi",
+            "next", "tarvatha", "continue chey", "continue cheyyi",
+            "inka emundi", "malli cheppu", "proceed", "carry on", "continue please",
+            "continue response", "continue from where you left off",
+            "continue chey bro", "continue bro", "inka cheppu bro"
+        )
+        if (p in exactMatches) return true
+        if (p.startsWith("continue") || p.startsWith("inka ") || p.startsWith("go on")) return true
+        val words = p.split(Regex("""\s+""")).filter { it.isNotBlank() }
+        if (words.size <= 3 && (words.contains("continue") || words.contains("inka") || words.contains("tarvatha"))) return true
+        return false
     }
 
     fun isFlowchartRequest(prompt: String): Boolean {
@@ -577,6 +620,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             "explain with flowchart", "flowchart tho"
         )
         return keywords.any { p.contains(it) }
+    }
+
+    fun isPdfRequest(prompt: String): Boolean {
+        val p = prompt.lowercase().trim()
+        if (!p.contains("pdf")) return false
+        val actionKeywords = listOf(
+            "make", "create", "generate", "give", "notes", "cheyyi", "chey",
+            "ivvu", "format", "convert", "export", "doc", "document", "sheet",
+            "summary", "guide", "download", "prepare", "write", "rayi", "pettu",
+            "cheymante", "lo ivvu", "pdf chesi", "pdf lo"
+        )
+        return actionKeywords.any { p.contains(it) } || p.endsWith("pdf") || p.startsWith("pdf")
     }
 
     fun stripToolCallJson(text: String): String {
@@ -616,6 +671,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _attachedDocument.value = null
     }
 
+    fun setResponseFeedback(messageId: String, feedback: ResponseFeedback) {
+        val sessionId = _currentSessionId.value
+        updateSessionMessages(sessionId) { messages ->
+            messages.map { message ->
+                if (message.id == messageId) {
+                    message.copy(feedback = if (message.feedback == feedback) null else feedback)
+                } else message
+            }
+        }
+        persistChat()
+    }
+
     fun toggleSpeak(messageId: String, text: String) {
         ttsManager.speak(messageId, text)
     }
@@ -635,17 +702,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (rawInput.isEmpty() && doc == null) return
         if (_isGenerating.value) return
 
-        // Clear input text and attached document immediately
-        _inputText.value = ""
-        _attachedDocument.value = null
-
-        ttsManager.stop()
-
         val eng = engine
         if (eng == null || _engineState.value !is EngineState.Ready) {
             _errorMessage.value = "Please wait for Gemma 4 to finish loading before sending."
             return
         }
+
+        // Do not discard a draft or attachment until the model can actually accept it.
+        // Keeping the input intact lets the user retry after startup instead of having to
+        // recreate a long message or reattach a file.
+        _inputText.value = ""
+        _attachedDocument.value = null
+        ttsManager.stop()
 
         // Autonomous Brain & Memory Detection (ChatGPT-style auto memory extraction & forget)
         val memoryAction = AutonomousBrainMemoryHelper.evaluateUserUtterance(rawInput, memoryManager.memories.value)
@@ -700,11 +768,35 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             else -> rawInput
         }
 
+        val isContinue = isContinueRequest(rawInput) && !isImage
         val isDocument = doc != null && !doc.isImage
-        val isVisualRequest = shouldQueryImages(rawInput) && !isImage && !isDocument
-        val useWebSearch = (_isWebSearchEnabled.value || (shouldAutoSearch(rawInput) && !isDocument) || isVisualRequest) && !isImage && !isDocument
+        val isVisualRequest = !isContinue && shouldQueryImages(rawInput) && !isImage && !isDocument
+        val useWebSearch = !isContinue && (_isWebSearchEnabled.value || (shouldAutoSearch(rawInput) && !isDocument) || isVisualRequest) && !isImage && !isDocument
 
-        _attachedDocument.value = null
+        // Direct device action execution (alarms, whatsapp, calendar, timers)
+        val directDeviceIntentArgs = if (!isImage && doc == null) {
+            com.teja.gemmmobile.tools.DeviceIntentsTool.parseIntentArguments(rawInput)
+        } else null
+
+        if (directDeviceIntentArgs != null) {
+            val userMsg = ChatMessage(
+                id = UUID.randomUUID().toString(),
+                role = MessageRole.USER,
+                text = rawInput
+            )
+            viewModelScope.launch {
+                val execResult = skillRegistry.deviceIntentsTool.execute(directDeviceIntentArgs)
+                val assistantMsg = ChatMessage(
+                    id = UUID.randomUUID().toString(),
+                    role = MessageRole.ASSISTANT,
+                    text = execResult.content,
+                    isStreaming = false
+                )
+                updateSessionMessages(_currentSessionId.value) { it + userMsg + assistantMsg }
+            }
+            return
+        }
+
         val userMessageId = UUID.randomUUID().toString()
         val savedImagePath = if (isImage && (doc.imageBytes != null || doc.previewBitmap != null)) {
             com.teja.gemmmobile.storage.StorageManagerHelper.compressAndSaveImageSync(
@@ -799,6 +891,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val isProductRequest = isProductQuery(prompt) || isProductQuery(cleanQuery)
 
                 val isVisualQuery = isVisual && imageBytes == null && !isDocument && !hasDocInSession
+                val lowerPrompt = prompt.lowercase()
+                val isExplicitPhotoRequest = lowerPrompt.contains("photo") ||
+                        lowerPrompt.contains("image") ||
+                        lowerPrompt.contains("picture") ||
+                        lowerPrompt.contains("pic") ||
+                        lowerPrompt.contains("diagram") ||
+                        lowerPrompt.contains("chupinchu") ||
+                        lowerPrompt.contains("chudu") ||
+                        lowerPrompt.contains("bomma") ||
+                        lowerPrompt.contains("wallpaper")
                 val effectiveUseWebSearch = useWebSearch && !isDocument && !hasDocInSession
 
                 if (effectiveUseWebSearch || isVisualQuery) {
@@ -857,13 +959,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                     }
                                 }
 
-                                val imageJob = if (isProductRequest) {
+                                val shouldSearchImages = isExplicitPhotoRequest || isProductRequest
+
+                                val imageJob = if (shouldSearchImages) {
                                     async {
                                         try {
                                             val baseVisualQ = searchManager.cleanVisualQuery(cleanQuery)
-                                            val productVisualQ = if (!baseVisualQ.lowercase().contains("product")) "$baseVisualQ product packshot" else baseVisualQ
+                                            val visualQ = if (isProductRequest && !baseVisualQ.lowercase().contains("product")) {
+                                                "$baseVisualQ product packshot"
+                                            } else {
+                                                baseVisualQ
+                                            }
                                             kotlinx.coroutines.withTimeoutOrNull(7000L) {
-                                                searchManager.searchImages(productVisualQ, maxImages = 6)
+                                                searchManager.searchImages(visualQ, maxImages = 6)
                                             } ?: emptyList()
                                         } catch (_: Exception) {
                                             emptyList()
@@ -875,12 +983,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 if (searchResp != null && searchResp.results.isNotEmpty()) {
                                     searchResults = searchResp.results.map { it.toSearchResult() }
                                     searchContext = searchManager.formatGemmaWebContext(searchResp.results)
-                                    if (searchResp.images.isNotEmpty()) {
+                                    if (shouldSearchImages && searchResp.images.isNotEmpty()) {
                                         searchImages = searchResp.images
                                     }
                                 }
-                                if (searchImages.isEmpty() && imageJob != null) {
-                                    searchImages = imageJob.await()
+                                if (shouldSearchImages && imageJob != null) {
+                                    val fetchedImages = imageJob.await()
+                                    if (searchImages.isEmpty()) {
+                                        searchImages = fetchedImages
+                                    } else if (fetchedImages.isNotEmpty()) {
+                                        val seen = searchImages.map { it.imageUrl }.toMutableSet()
+                                        val combined = searchImages.toMutableList()
+                                        for (img in fetchedImages) {
+                                            if (seen.add(img.imageUrl) && combined.size < 8) {
+                                                combined.add(img)
+                                            }
+                                        }
+                                        searchImages = combined
+                                    }
                                 }
                             }
                         } catch (t: Throwable) {
@@ -895,7 +1015,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 searchImages = searchImages,
                                 isSearchingWeb = false,
                                 isExecutingTool = false,
-                                toolExecutionStatus = null
+                                toolExecutionStatus = null,
+                                isExplicitVisualRequest = isExplicitPhotoRequest || isVisualQuery
                             ) else msg
                         }
                     }
@@ -907,32 +1028,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val baseSystemPrompt = _config.value.systemPrompt.ifBlank { GemmaConfig.DEFAULT_SYSTEM_PROMPT }
                 val allowTools = !isDocument && !hasDocInSession && imageBytes == null && searchContext.isBlank()
 
+                val isContinue = isContinueRequest(prompt)
+                val matchedSkill = skillRegistry.findMatchingSkill(prompt)
                 val effectiveSystemPrompt = when {
                     imageBytes != null -> "You are a helpful assistant. Directly and accurately describe what is in the image in plain language."
-                    searchContext.isNotBlank() && isProductRequest -> {
-                        "$baseSystemPrompt\n\n## PRODUCT RECOMMENDATIONS\n" +
-                        "Live web results with real products and shopping links are provided above. " +
-                        "Recommend 2 to 3 top specific products (e.g. Minimalist, Neutrogena, Derma Co) in clean ChatGPT format:\n" +
-                        "1. Write 1 natural introductory sentence in the user's language.\n" +
-                        "2. For each recommended product, output a structured block:\n" +
-                        ":::product\n" +
-                        "title: [Specific Brand & Product Name]\n" +
-                        "badge: [e.g. Top Recommendation / Best Budget Pick / Best Overall]\n" +
-                        "price: [e.g. ₹399 / Around ₹499]\n" +
-                        "description: [2 sentences on why it is recommended and key benefits]\n" +
-                        "source: [Store or brand name, e.g. Amazon / Nykaa / Minimalist]\n" +
-                        "url: [Direct product Source URL from live web results above]\n" +
-                        ":::\n" +
-                        "3. Conclude with 1 helpful tip. Never say you cannot browse or provide links."
+                    isContinue -> {
+                        "$baseSystemPrompt\n\n## CONTINUATION PROTOCOL\n" +
+                        "The user asked to continue the previous explanation. Pick up immediately with the next point without any conversational filler, greetings, or repetition. Deliver the remaining content and wrap up with a natural conclusion."
                     }
                     searchContext.isNotBlank() -> {
-                        "$baseSystemPrompt\n\n## WEB SEARCH EVIDENCE INSTRUCTION\n" +
-                        "Live web search evidence is provided above. Synthesize the facts into a comprehensive, cohesive narrative like ChatGPT. " +
-                        "Write in natural, well-formed paragraphs that weave the background, education, achievements, and career details together smoothly. " +
-                        "Do NOT output a rigid list of attribute headers (avoid '• Location: ...', '• Education: ...'). " +
-                        "Do NOT assume or guess gender if unconfirmed; refer to the person by name or neutral phrasing. " +
-                        "Never claim you cannot browse or access real-time information; live web search evidence is provided to you above. " +
-                        "Deliver a polished, complete explanation directly answering the user."
+                        "$baseSystemPrompt\n\n" +
+                        "Live web search results are provided above. Answer the user's question clearly, accurately, and naturally based on the search results. " +
+                        "If sources or links are present, cite them naturally. " +
+                        "Respond in the same language as the user's message (English or Telugu)."
+                    }
+                    matchedSkill != null -> {
+                        "$baseSystemPrompt\n\n${matchedSkill.systemDirective}\n\n${toolRegistry.getToolsDocumentation()}\nWhen actions, alarms, QR codes, or external data are required, YOU MUST invoke a tool using JSON."
                     }
                     isFlowchartRequest(prompt) -> {
                         "$baseSystemPrompt\n\n## FLOWCHART & PROCESS DIAGRAM INSTRUCTION\n" +
@@ -956,18 +1067,26 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val effectivePrompt = if (imageBytes != null) {
                     prompt
                 } else {
-                    val isContinue = isContinueRequest(prompt)
                     val promptToUse = when {
                         isVisualQuery -> {
                             val visualSubject = searchManager.cleanVisualQuery(prompt).replace(Regex("""\s+diagram""", RegexOption.IGNORE_CASE), "").trim()
                             "Please provide a comprehensive explanation of the architecture, key components, and workflow of $visualSubject in detail. Structure your answer with clear headings and bullet points."
                         }
+                        isPdfRequest(prompt) -> {
+                            "$prompt\n\n(Please format this directly as a comprehensive, highly structured study document with clear headings (# Title, ## Section), definitions, detailed bullet points, equations/formulas, and key takeaways formatted for a clean PDF document.)"
+                        }
                         isContinue -> {
                             val lastAssistant = targetMsgs.lastOrNull { it.role == MessageRole.ASSISTANT && it.id != assistantMessageId && it.text.isNotBlank() }
                             val lastText = lastAssistant?.text?.trim() ?: ""
-                            val tailSnippet = if (lastText.length > 120) lastText.takeLast(120) else lastText
+                            val tailSnippet = if (lastText.length > 300) lastText.takeLast(300) else lastText
                             if (tailSnippet.isNotBlank()) {
-                                "Please seamlessly continue the previous explanation directly from where you left off: \"...$tailSnippet\". Do NOT repeat any introduction or points already covered. Continue immediately with the next point and finish with a complete conclusion."
+                                "## CONTINUATION DIRECTIVE\n" +
+                                "The user requested to continue the previous response that ended at:\n" +
+                                "\"\"\"\n...$tailSnippet\n\"\"\"\n\n" +
+                                "INSTRUCTIONS:\n" +
+                                "1. Pick up IMMEDIATELY from that exact point. Continue seamlessly with the very next word or sentence.\n" +
+                                "2. DO NOT output conversational filler like 'Sure!', 'Certainly!', 'Continuing from where we left off...', or repeat any text already stated.\n" +
+                                "3. Continue in the same language and tone, and finish with a natural conclusion."
                             } else {
                                 "Please continue the previous explanation thoroughly and conclude."
                             }
@@ -991,12 +1110,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 var lastUiUpdateTime = 0L
                 val UI_THROTTLE_MS = 100L // 10 updates/sec: smooth fluid streaming while freeing CPU cycles
 
+                var nativeToolCallRequest: com.teja.gemmmobile.tools.ToolCallRequest? = null
+
                 eng.sendMessage(
                     prompt = effectivePrompt,
                     systemInstruction = effectiveSystemPrompt,
                     imageBytes = imageBytes,
-                    enableThinkingOverride = if (useWebSearch) false else null,
-                    dynamicMaxOutputOverride = if (useWebSearch) com.teja.gemmmobile.search.SearchConfig.MAX_WEB_OUTPUT_TOKENS else null
+                    enableThinkingOverride = if (effectiveUseWebSearch || searchContext.isNotBlank()) false else null,
+                    dynamicMaxOutputOverride = if (effectiveUseWebSearch || searchContext.isNotBlank()) com.teja.gemmmobile.search.SearchConfig.MAX_WEB_OUTPUT_TOKENS else null
                 )
                     .catch { error ->
                         Log.e(TAG, "[$TAG] Stream error", error)
@@ -1016,6 +1137,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                     .collect { chunk ->
+                        if (chunk.toolCalls.isNotEmpty() && nativeToolCallRequest == null) {
+                            val firstTc = chunk.toolCalls.first()
+                            nativeToolCallRequest = com.teja.gemmmobile.tools.ToolCallRequest(
+                                name = firstTc.name,
+                                arguments = firstTc.arguments
+                            )
+                            Log.d(TAG, "[$TAG] Captured native LiteRT-LM tool call: ${firstTc.name}")
+                        }
+
                         if (chunk.thought.isNotEmpty()) {
                             thoughtBuilder.append(chunk.thought)
                         }
@@ -1065,16 +1195,29 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                 val allowToolCalls = !isDocument && !hasDocInSession && imageBytes == null
                 while (allowToolCalls && currentToolStep < MAX_TOOL_STEPS) {
-                    var detectedToolCall = toolRegistry.parseToolCall(currentGenerationText)
+                    var detectedToolCall = nativeToolCallRequest ?: toolRegistry.parseToolCall(currentGenerationText)
+                    nativeToolCallRequest = null // consume once
 
-                    // Autonomous Agent Loop Fallback: If model refused to browse live web or check info, intercept and execute web_search!
-                    if (detectedToolCall == null && currentToolStep == 0 && isRefusalToBrowse(currentGenerationText)) {
-                        val fallbackQuery = resolveSearchQuery(prompt, targetMsgs)
-                        Log.i(TAG, "[$TAG] Agent loop intercepted model web-refusal! Autonomous execution of web_search for '$fallbackQuery'")
-                        detectedToolCall = com.teja.gemmmobile.tools.ToolCallRequest(
-                            name = "web_search",
-                            arguments = mapOf("query" to fallbackQuery)
-                        )
+                    // Autonomous Agent Loop Fallback: If model refused or query asked for visuals and no tool has run yet
+                    if (detectedToolCall == null && currentToolStep == 0) {
+                        if (isRefusalToBrowse(currentGenerationText) || isRefusalToSearchImages(currentGenerationText)) {
+                            val fallbackQuery = resolveSearchQuery(prompt, targetMsgs)
+                            val toolName = if (shouldQueryImages(prompt) || isVisual) "image_search" else "web_search"
+                            Log.i(TAG, "[$TAG] Agent loop intercepted model refusal! Autonomous execution of $toolName for '$fallbackQuery'")
+                            detectedToolCall = com.teja.gemmmobile.tools.ToolCallRequest(
+                                name = toolName,
+                                arguments = mapOf("query" to fallbackQuery)
+                            )
+                        } else if ((shouldQueryImages(prompt) || isVisual) && searchImages.isEmpty() && currentSearchImages.isEmpty()) {
+                            val visualQ = searchManager.cleanVisualQuery(prompt)
+                            if (visualQ.isNotBlank()) {
+                                Log.i(TAG, "[$TAG] Agent loop triggered image_search for visual request '$visualQ'")
+                                detectedToolCall = com.teja.gemmmobile.tools.ToolCallRequest(
+                                    name = "image_search",
+                                    arguments = mapOf("query" to visualQ)
+                                )
+                            }
+                        }
                     }
 
                     if (detectedToolCall == null) break
@@ -1134,24 +1277,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         cleanQuery
                     }
 
-                    val isNextProduct = isProductQuery(nextTurnSubject) || isProductQuery(prompt)
-                    val nextTurnSystemPrompt = if (isNextProduct) {
-                        "You are a helpful, accurate AI assistant. Live web search results with product listings and links are provided below. " +
-                        "Synthesize the findings into clear, direct recommendations like ChatGPT:\n" +
-                        "1. Write a natural introduction in smooth prose.\n" +
-                        "2. For each recommended product, output a structured block:\n" +
-                        ":::product\n" +
-                        "title: [Exact product name]\n" +
-                        "badge: [e.g. Best overall / Top budget pick] (optional)\n" +
-                        "price: [e.g. Listed around ₹499; verify current price]\n" +
-                        "description: [2-3 sentences explaining why it is recommended]\n" +
-                        "source: [Store/Brand name]\n" +
-                        "url: [Link from tool results]\n" +
-                        ":::\n" +
-                        "3. Conclude with a helpful tip. Never say you cannot browse or access e-commerce sites."
-                    } else {
-                        "You are a helpful, accurate AI assistant. Use the tool results below as factual evidence. Provide a direct, natural explanation. Do not call any further tools or output JSON."
-                    }
+                    val nextTurnSystemPrompt = "$baseSystemPrompt\n\n" +
+                        "Live web results are provided below as factual evidence. Answer the user's question clearly, accurately, and directly based on this information. " +
+                        "Cite sources naturally. Do not call any further tools."
 
                     val nextTurnPrompt = contextManager.buildPrompt(
                         systemPrompt = nextTurnSystemPrompt,
@@ -1159,7 +1287,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         memoryContext = memoryContext,
                         conversationHistory = targetMsgs.filter { it.id != assistantMessageId },
                         currentPrompt = if (isImageTool) "Explain the architecture, components, and workflow of $nextTurnSubject in detail based on the images above." else prompt,
-                        toolResultsContext = accumulatedToolResults.toString().take(1000)
+                        toolResultsContext = accumulatedToolResults.toString().take(4000)
                     )
 
                     val nextTurnBuilder = StringBuilder()
@@ -1168,10 +1296,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             if (msg.id == assistantMessageId) {
                                 msg.copy(
                                     searchResults = searchResults,
-                                    searchImages = if (currentSearchImages.isNotEmpty()) currentSearchImages else msg.searchImages,
+                                    searchImages = if (currentSearchImages.isNotEmpty()) currentSearchImages else if (searchImages.isNotEmpty()) searchImages else msg.searchImages,
                                     isExecutingTool = false,
                                     toolExecutionStatus = null,
-                                    isStreaming = true
+                                    isStreaming = true,
+                                    isExplicitVisualRequest = isExplicitPhotoRequest || isVisualQuery
                                 )
                             } else msg
                         }
@@ -1242,6 +1371,26 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     else -> "I couldn't generate a response. Please try again with a shorter prompt."
                 }
 
+                val isPdf = isPdfRequest(prompt)
+                var autoPdfPath: String? = null
+                var autoPdfTitle: String? = null
+                var autoPdfPages = 0
+
+                if (isPdf && resolvedText.isNotBlank()) {
+                    try {
+                        val pdfResult = com.teja.gemmmobile.pdf.PdfExporter.generatePdf(
+                            context = getApplication(),
+                            markdownText = resolvedText,
+                            title = null
+                        )
+                        autoPdfPath = pdfResult.file.absolutePath
+                        autoPdfTitle = pdfResult.title
+                        autoPdfPages = pdfResult.pageCount
+                    } catch (e: Exception) {
+                        Log.w(TAG, "[$TAG] Auto PDF generation error", e)
+                    }
+                }
+
                 updateSessionMessages(targetSessionId) { msgs ->
                     msgs.map { msg ->
                         if (msg.id == assistantMessageId) {
@@ -1249,12 +1398,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 text = resolvedText,
                                 thoughtText = if (resolvedText == finalThought) "" else finalThought,
                                 searchResults = searchResults,
-                                searchImages = if (currentSearchImages.isNotEmpty()) currentSearchImages else msg.searchImages,
+                                searchImages = if (currentSearchImages.isNotEmpty()) currentSearchImages else if (searchImages.isNotEmpty()) searchImages else msg.searchImages,
                                 isStreaming = false,
                                 isThinking = false,
                                 isSearchingWeb = false,
                                 isExecutingTool = false,
-                                toolExecutionStatus = null
+                                toolExecutionStatus = null,
+                                isExplicitVisualRequest = isExplicitPhotoRequest || isVisualQuery,
+                                generatedPdfPath = autoPdfPath,
+                                generatedPdfTitle = autoPdfTitle,
+                                generatedPdfPageCount = autoPdfPages
                             )
                         } else msg
                     }
@@ -1537,6 +1690,45 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun dismissError() {
         _errorMessage.value = null
+    }
+
+    /** Retries the last turn when possible, or restarts the model if it is unavailable. */
+    fun retryLastResponse() {
+        if (_isGenerating.value) return
+        if (engine == null || _engineState.value !is EngineState.Ready) {
+            initializeEngine()
+            return
+        }
+        dismissError()
+        regenerateLastResponse()
+    }
+
+    fun generatePdfForMessage(messageId: String, text: String, title: String? = null) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val result = com.teja.gemmmobile.pdf.PdfExporter.generatePdf(
+                    context = getApplication(),
+                    markdownText = text,
+                    title = title
+                )
+                updateSessionMessages(_currentSessionId.value) { msgs ->
+                    msgs.map { msg ->
+                        if (msg.id == messageId) {
+                            msg.copy(
+                                generatedPdfPath = result.file.absolutePath,
+                                generatedPdfTitle = result.title,
+                                generatedPdfPageCount = result.pageCount
+                            )
+                        } else msg
+                    }
+                }
+                withContext(Dispatchers.Main) {
+                    com.teja.gemmmobile.pdf.PdfExporter.openPdf(getApplication(), result.file)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "[$TAG] Error generating PDF for message $messageId", e)
+            }
+        }
     }
 
     override fun onCleared() {

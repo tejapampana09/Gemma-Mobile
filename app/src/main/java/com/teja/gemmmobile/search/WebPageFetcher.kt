@@ -58,16 +58,9 @@ open class WebPageFetcher {
             RegexOption.IGNORE_CASE
         )
 
-        // Cookie banners, GDPR consent dialogs, and tracking overlays
-        private val COOKIE_BANNER_REGEX = Regex(
-            """<(?:div|section|aside|dialog)[^>]+(?:id|class)=["'][^"']*(?:cookie|consent|gdpr|banner|privacy-bar)[^"']*["'][^>]*>.*?</(?:div|section|aside|dialog)>""",
-            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
-        )
-
-        // Strip non-content blocks (scripts, styles, svg, noscript, nav, header, footer, aside, forms)
-        private val UNWANTED_TAGS_REGEX = Regex(
-            """<(script|style|noscript|svg|header|footer|nav|aside|form|template)\b[^>]*>.*?</\1>""",
-            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        // Tags to strip entirely with their contents (linear non-backtracking removal)
+        private val UNWANTED_TAG_NAMES = listOf(
+            "script", "style", "noscript", "svg", "header", "footer", "nav", "aside", "form", "template"
         )
 
         // Structural tags that represent line breaks or paragraph dividers
@@ -265,47 +258,105 @@ open class WebPageFetcher {
         return text
     }
 
+    private fun stripTagBlocks(html: String, tags: List<String>): String {
+        var result = html
+        for (tag in tags) {
+            val openTag = "<$tag"
+            val closeTag = "</$tag>"
+            var startIndex = result.indexOf(openTag, ignoreCase = true)
+            while (startIndex != -1) {
+                val endIndex = result.indexOf(closeTag, startIndex, ignoreCase = true)
+                if (endIndex != -1) {
+                    val removeEnd = endIndex + closeTag.length
+                    result = result.substring(0, startIndex) + " " + result.substring(removeEnd)
+                    startIndex = result.indexOf(openTag, startIndex, ignoreCase = true)
+                } else {
+                    val tagEnd = result.indexOf('>', startIndex)
+                    if (tagEnd != -1) {
+                        result = result.substring(0, startIndex) + " " + result.substring(tagEnd + 1)
+                    }
+                    break
+                }
+            }
+        }
+        return result
+    }
+
+    private fun stripCookieBanners(html: String): String {
+        val bannerKeywords = listOf("cookie", "consent", "gdpr", "banner", "privacy-bar")
+        val containerTags = listOf("div", "section", "aside", "dialog")
+        var result = html
+        for (tag in containerTags) {
+            val openPrefix = "<$tag"
+            val closeSuffix = "</$tag>"
+            var start = result.indexOf(openPrefix, ignoreCase = true)
+            while (start != -1) {
+                val tagClose = result.indexOf('>', start)
+                if (tagClose != -1) {
+                    val tagHeader = result.substring(start, tagClose).lowercase()
+                    if (tagHeader.contains("id=") || tagHeader.contains("class=")) {
+                        val isBanner = bannerKeywords.any { tagHeader.contains(it) }
+                        if (isBanner) {
+                            val end = result.indexOf(closeSuffix, tagClose, ignoreCase = true)
+                            if (end != -1 && end - start < 15000) {
+                                result = result.substring(0, start) + " " + result.substring(end + closeSuffix.length)
+                                start = result.indexOf(openPrefix, start, ignoreCase = true)
+                                continue
+                            }
+                        }
+                    }
+                }
+                start = result.indexOf(openPrefix, start + openPrefix.length, ignoreCase = true)
+            }
+        }
+        return result
+    }
+
     /**
      * Converts raw HTML markup into readable, normalized plain text bounded at sentence boundary.
      */
     fun extractReadableText(html: String, maxChars: Int = SearchConfig.MAX_PAGE_CONTENT_CHARS): String {
         if (html.isBlank()) return ""
 
-        // Check for bot wall or CAPTCHA before extraction
-        val lowerHtml = html.lowercase()
-        if (CAPTCHA_INDICATORS.any { lowerHtml.contains(it) }) {
-            return "" // Signal to rely on search snippet instead of scraping bot wall
+        return try {
+            // Check for bot wall or CAPTCHA before extraction
+            val lowerHtml = html.lowercase()
+            if (CAPTCHA_INDICATORS.any { lowerHtml.contains(it) }) {
+                return "" // Signal to rely on search snippet instead of scraping bot wall
+            }
+
+            // 1. Remove cookie banners & consent overlays (safe linear removal)
+            var text = stripCookieBanners(html)
+
+            // 2. Remove unwanted script, style, navigation, footer, etc. (safe linear removal)
+            text = stripTagBlocks(text, UNWANTED_TAG_NAMES)
+
+            // 3. Replace structural tags with newline separators
+            text = STRUCTURAL_TAGS_REGEX.replace(text, "\n")
+
+            // 4. Strip remaining HTML tags
+            text = STRIP_ALL_TAGS_REGEX.replace(text, " ")
+
+            // 5. Decode HTML entities
+            text = decodeHtmlEntities(text)
+
+            // 6. Normalize whitespace: trim lines and remove excessive blank lines
+            val lines = text.split("\n")
+                .map { it.replace(Regex("""[ \t\r\f]+"""), " ").trim() }
+                .filter { it.isNotBlank() }
+
+            val normalized = lines.joinToString("\n\n")
+
+            if (normalized.length <= maxChars) {
+                return normalized
+            }
+
+            // 7. Sentence boundary trimming near maxChars limit
+            val cutPoint = findSentenceBoundary(normalized, maxChars)
+            normalized.substring(0, cutPoint).trim() + "…"
+        } catch (_: Throwable) {
+            ""
         }
-
-        // 1. Remove cookie banners & consent overlays
-        var text = COOKIE_BANNER_REGEX.replace(html, "")
-
-        // 2. Remove unwanted script, style, navigation, footer, etc.
-        text = UNWANTED_TAGS_REGEX.replace(text, "")
-
-        // 3. Replace structural tags with newline separators
-        text = STRUCTURAL_TAGS_REGEX.replace(text, "\n")
-
-        // 4. Strip remaining HTML tags
-        text = STRIP_ALL_TAGS_REGEX.replace(text, " ")
-
-        // 5. Decode HTML entities
-        text = decodeHtmlEntities(text)
-
-        // 6. Normalize whitespace: trim lines and remove excessive blank lines
-        val lines = text.split("\n")
-            .map { it.replace(Regex("""[ \t\r\f]+"""), " ").trim() }
-            .filter { it.isNotBlank() }
-
-        val normalized = lines.joinToString("\n\n")
-
-        if (normalized.length <= maxChars) {
-            return normalized
-        }
-
-        // 7. Sentence boundary trimming near maxChars limit
-        val cutPoint = findSentenceBoundary(normalized, maxChars)
-        return normalized.substring(0, cutPoint).trim() + "…"
     }
 
     /**

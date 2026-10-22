@@ -86,6 +86,9 @@ dependencies {
     // JSON persistence
     implementation("com.google.code.gson:gson:2.11.0")
 
+    // ZXing for 100% on-device offline QR code generation
+    implementation("com.google.zxing:core:3.5.3")
+
     // Google ML Kit Text Recognition (On-device OCR)
     implementation("com.google.mlkit:text-recognition:16.0.1")
 

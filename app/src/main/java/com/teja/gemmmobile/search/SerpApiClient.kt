@@ -137,7 +137,8 @@ open class SerpApiClient(
                     SearchResult(
                         title = title,
                         url = link,
-                        snippet = snippet
+                        snippet = snippet,
+                        imageUrl = thumbnail
                     )
                 )
 
@@ -232,16 +233,17 @@ open class SerpApiClient(
                     }
                 }
 
+                val thumbnail = obj.get("thumbnail")?.asString?.trim()
                 searchResults.add(
                     SearchResult(
                         title = title,
                         url = link,
-                        snippet = enrichedSnippet
+                        snippet = enrichedSnippet,
+                        imageUrl = if (!thumbnail.isNullOrBlank() && thumbnail.startsWith("http")) thumbnail else null
                     )
                 )
 
                 // Inline thumbnail if available
-                val thumbnail = obj.get("thumbnail")?.asString?.trim()
                 if (!thumbnail.isNullOrBlank() && thumbnail.startsWith("http")) {
                     searchImages.add(
                         SearchImage(
@@ -283,7 +285,8 @@ open class SerpApiClient(
                         SearchResult(
                             title = pTitle,
                             url = "https://www.google.com/search?q=${URLEncoder.encode(pTitle, "UTF-8")}",
-                            snippet = pSnippet
+                            snippet = pSnippet,
+                            imageUrl = if (!pThumb.isNullOrBlank() && pThumb.startsWith("http")) pThumb else null
                         )
                     )
                 }

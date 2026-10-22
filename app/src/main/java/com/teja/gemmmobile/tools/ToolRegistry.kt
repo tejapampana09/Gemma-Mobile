@@ -55,15 +55,17 @@ class ToolRegistry {
         if (tools.isEmpty()) return ""
 
         val sb = StringBuilder()
-        sb.appendLine("## Available Tools")
-        sb.appendLine("Call tools only when external data or images are needed by outputting JSON:")
+        sb.appendLine("## Autonomous Tools")
+        sb.appendLine("You have real-time access to tools. When the user asks for images, photos, diagrams, or visual examples, YOU MUST call `image_search`.")
+        sb.appendLine("When the user asks for current facts, news, or web research, call `web_search`.")
+        sb.appendLine("To call a tool, output the tool call in this exact JSON format:")
         sb.appendLine("```json")
-        sb.appendLine("{\"name\": \"<tool_name>\", \"arguments\": {\"query\": \"<keywords>\"}}")
+        sb.appendLine("{\"name\": \"image_search\", \"arguments\": {\"query\": \"<search keywords>\"}}")
         sb.appendLine("```")
-        sb.appendLine("- `image_search`: Diagrams, photos, architecture visuals (arguments: {\"query\": \"...\"})")
-        sb.appendLine("- `web_search`: Live facts, current news, real-time web info (arguments: {\"query\": \"...\"})")
-        sb.appendLine("- `manage_memory`: Save user facts/preferences (arguments: {\"action\": \"save\", \"fact\": \"...\"})")
-        sb.appendLine("For general conversation, concepts, coding, or explanations, do NOT call any tool; answer directly with clear text.")
+        sb.appendLine("- `image_search`: Search and display web photos, diagrams, architecture visuals, wallpapers, or images (arguments: {\"query\": \"...\"})")
+        sb.appendLine("- `web_search`: Search live web for facts, recent events, websites, or articles (arguments: {\"query\": \"...\"})")
+        sb.appendLine("- `manage_memory`: Save user personal preferences or facts (arguments: {\"action\": \"save\", \"fact\": \"...\"})")
+        sb.appendLine("Never say you cannot browse or cannot show images. Call the appropriate tool immediately.")
         return sb.toString().trim()
     }
 
@@ -163,6 +165,46 @@ class ToolRegistry {
     fun parseToolCall(rawText: String): ToolCallRequest? {
         if (rawText.isBlank()) return null
 
+        // 1. Tag or prefix-style tool calls (LiteRT-LM & Gemma native conventions):
+        // e.g. <call:image_search>{"query": "..."}</call> or call:image_search{"query": "..."} or <tool_call:image_search>{...}
+        val tagPrefixRegex = Regex("""(?:<call:|<tool_call:|<action:|call:)?(image_search|web_search|manage_memory|ocr)(?:>)?\s*(\{[\s\S]*?\})""", RegexOption.IGNORE_CASE)
+        val tagMatch = tagPrefixRegex.find(rawText)
+        if (tagMatch != null) {
+            val toolName = resolveToolName(tagMatch.groupValues[1])
+            val jsonCandidate = tagMatch.groupValues[2]
+            try {
+                val element = JsonParser.parseString(jsonCandidate)
+                if (element.isJsonObject) {
+                    val obj = element.asJsonObject
+                    val args = mutableMapOf<String, Any?>()
+                    val argsObj = if (obj.has("arguments") && obj.get("arguments").isJsonObject) {
+                        obj.getAsJsonObject("arguments")
+                    } else if (obj.has("parameters") && obj.get("parameters").isJsonObject) {
+                        obj.getAsJsonObject("parameters")
+                    } else {
+                        obj
+                    }
+                    for ((k, v) in argsObj.entrySet()) {
+                        args[k] = jsonElementToAny(v)
+                    }
+                    if (tools.containsKey(toolName)) {
+                        return ToolCallRequest(name = toolName, arguments = args)
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
+        // Tag attribute format: e.g. <call:image_search query="..."/>
+        val tagAttrRegex = Regex("""<call:(image_search|web_search|manage_memory)\s+query=["']([^"']+)["']\s*/?>""", RegexOption.IGNORE_CASE)
+        val tagAttrMatch = tagAttrRegex.find(rawText)
+        if (tagAttrMatch != null) {
+            val toolName = resolveToolName(tagAttrMatch.groupValues[1])
+            val queryVal = tagAttrMatch.groupValues[2].trim()
+            if (tools.containsKey(toolName) && queryVal.isNotBlank()) {
+                return ToolCallRequest(name = toolName, arguments = mapOf("query" to queryVal))
+            }
+        }
+
         val candidates = extractBalancedJsonCandidates(rawText)
 
         for (candidate in candidates) {
@@ -183,12 +225,27 @@ class ToolRegistry {
                     obj
                 }
 
-                val rawToolName = when {
+                var rawToolName = when {
                     targetObj.has("name") -> targetObj.get("name").asString
                     targetObj.has("tool") -> targetObj.get("tool").asString
                     targetObj.has("function") -> targetObj.get("function").asString
                     else -> null
-                } ?: continue
+                }
+
+                // If candidate has arguments but no explicit name, check if preceding text names the tool
+                if (rawToolName == null && (targetObj.has("query") || targetObj.has("q"))) {
+                    val cIdx = rawText.indexOf(candidate)
+                    if (cIdx > 0) {
+                        val prefix = rawText.substring(0, cIdx).lowercase()
+                        rawToolName = when {
+                            prefix.contains("image_search") || prefix.contains("search_image") -> "image_search"
+                            prefix.contains("web_search") || prefix.contains("search_web") -> "web_search"
+                            else -> null
+                        }
+                    }
+                }
+
+                if (rawToolName == null) continue
 
                 val toolName = resolveToolName(rawToolName)
 
@@ -206,6 +263,10 @@ class ToolRegistry {
                 if (argsElement != null && argsElement.isJsonObject) {
                     val argsObj = argsElement.asJsonObject
                     for ((key, value) in argsObj.entrySet()) {
+                        args[key] = jsonElementToAny(value)
+                    }
+                } else if (targetObj.has("query") || targetObj.has("q")) {
+                    for ((key, value) in targetObj.entrySet()) {
                         args[key] = jsonElementToAny(value)
                     }
                 }

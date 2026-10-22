@@ -10,5 +10,6 @@ data class SearchImage(
     val title: String,
     val imageUrl: String,
     val sourceUrl: String,
-    val sourceDomain: String = ""
+    val sourceDomain: String = "",
+    val thumbnailUrl: String = ""
 )

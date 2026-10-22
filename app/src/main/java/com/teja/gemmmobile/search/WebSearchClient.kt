@@ -24,7 +24,8 @@ private const val TAG = "WebSearchClient"
 data class SearchResult(
     val title: String,
     val url: String,
-    val snippet: String
+    val snippet: String,
+    val imageUrl: String? = null
 )
 
 /**
@@ -95,13 +96,10 @@ open class WebSearchClient {
             "find out about ", "find out ", "find for ", "find ",
             "give product links for ", "give product links ", "give links for ", "give links ", "give options for ", "give options ",
             "web and give product links for ", "web and give product links ", "web and give links ", "web and ",
-            "tell me who is ", "tell me who was ", "tell me what is ", "tell me what was ", "tell me about ", "tell me ",
+            "can you tell me who is ", "can you tell me about ",
+            "tell me about ", "tell me ",
             "search for ", "search ",
-            "who is ", "who was ", "who are ", "who were ",
-            "what is ", "what was ", "what are ", "what were ",
-            "where is ", "where was ", "where are ",
-            "when is ", "when was ", "when did ",
-            "why is ", "why did ", "how does ", "how to ",
+            "profile of ", "biography of ", "bio of ",
             "information about ", "info about ", "details about ", "details of "
         )
 
@@ -113,7 +111,6 @@ open class WebSearchClient {
         val teluguSuffixes = listOf(
             " gurinchi vivarinchu", " gurinchi cheppu", " gurinchi telupu", " gurinchi",
             " vivarana cheppu", " vivarana", " cheppandi", " cheppu", " telupandi", " telupu",
-            " ante enti", " enti", " telusu", " telusaa",
             " in telugu", " telugu lo", " please", " explain"
         )
 
@@ -190,9 +187,7 @@ open class WebSearchClient {
             Log.d(TAG, "[$TAG] Initiating broad parallel web search for: '$clean' (raw: '$query')")
 
             val isProduct = isProductSearch(clean)
-            val effectiveBingQuery = if (isProduct && !clean.lowercase().contains("amazon") && !clean.lowercase().contains("flipkart")) {
-                "$clean buy online Amazon Flipkart India price"
-            } else clean
+            val effectiveBingQuery = clean
 
             // Concurrently query search engines in parallel:
             // For product queries: DDG HTML (best for Amazon.in, Flipkart, Indian prices) + Bing Web Search
@@ -204,14 +199,14 @@ open class WebSearchClient {
                         } else {
                             fetchDuckDuckGoLite(clean, maxResults * 2)
                         }
-                    } catch (_: Exception) { emptyList() }
+                    } catch (_: Throwable) { emptyList() }
                 }
                 val bingDeferred = async {
-                    try { fetchBingWeb(effectiveBingQuery, maxResults * 2) } catch (_: Exception) { emptyList() }
+                    try { fetchBingWeb(effectiveBingQuery, maxResults * 2) } catch (_: Throwable) { emptyList() }
                 }
                 val wikiDeferred = if (!isProduct) {
                     async {
-                        try { fetchWikipedia(clean, 3) } catch (_: Exception) { emptyList() }
+                        try { fetchWikipedia(clean, 3) } catch (_: Throwable) { emptyList() }
                     }
                 } else null
                 Triple(ddgDeferred.await(), bingDeferred.await(), wikiDeferred?.await() ?: emptyList())
@@ -254,10 +249,11 @@ open class WebSearchClient {
      * Queries Wikipedia Search API directly (50ms, zero rate limits, high encyclopedic authority).
      */
     fun fetchWikipedia(query: String, maxResults: Int = 3): List<SearchResult> {
+        var conn: HttpURLConnection? = null
         return try {
             val encodedQuery = URLEncoder.encode(query, "UTF-8")
             val endpoint = URL("https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=$encodedQuery&format=json&utf8=1&srlimit=$maxResults")
-            val conn = endpoint.openConnection() as HttpURLConnection
+            conn = endpoint.openConnection() as HttpURLConnection
             conn.requestMethod = "GET"
             conn.connectTimeout = 3000
             conn.readTimeout = 3000
@@ -289,20 +285,20 @@ open class WebSearchClient {
             } else {
                 emptyList()
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.d(TAG, "[$TAG] Wikipedia search skipped: ${e.message}")
             emptyList()
+        } finally {
+            try { conn?.disconnect() } catch (_: Throwable) {}
         }
     }
 
     fun isProductSearch(query: String): Boolean {
         val q = query.lowercase().trim()
         val terms = listOf(
-            "suggest", "recommend", "best phone", "best mobile", "best laptop", "best sunscreen",
-            "phone under", "mobile under", "laptop under", "under 10000", "under 15000", "under 20000",
-            "under 25000", "under 30000", "under 40000", "under 50000", "under 500", "under 1000",
-            "sunscreen", "mobile", "phone", "laptop", "smartwatch", "earbuds", "headphones",
-            "buy ", "price", "shopping", "products", "manchi phone", "manchi mobile"
+            "buy online", "buy in india", "shopping", "where to buy",
+            "price in india", "under 10000", "under 15000", "under 20000",
+            "under 25000", "under 30000", "under 40000", "under 50000"
         )
         return terms.any { q.contains(it) }
     }
@@ -312,9 +308,10 @@ open class WebSearchClient {
      * Uses POST, which bypasses duck CAPTCHAs and returns broad web results (Wikipedia, IMDb, news, blogs).
      */
     fun fetchDuckDuckGoLite(query: String, maxResults: Int): List<SearchResult> {
+        var conn: HttpURLConnection? = null
         return try {
             val endpoint = URL("https://lite.duckduckgo.com/lite/")
-            val conn = endpoint.openConnection() as HttpURLConnection
+            conn = endpoint.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.connectTimeout = 4500
             conn.readTimeout = 4500
@@ -339,9 +336,11 @@ open class WebSearchClient {
             } else {
                 emptyList()
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.w(TAG, "[$TAG] DDG Lite query failed for '$query'", e)
             emptyList()
+        } finally {
+            try { conn?.disconnect() } catch (_: Throwable) {}
         }
     }
 
@@ -375,9 +374,10 @@ open class WebSearchClient {
      * DuckDuckGo HTML search endpoint (fallback).
      */
     fun fetchDuckDuckGoHtml(query: String, maxResults: Int): List<SearchResult> {
+        var conn: HttpURLConnection? = null
         return try {
             val endpoint = URL("https://html.duckduckgo.com/html/?q=" + URLEncoder.encode(query, "UTF-8"))
-            val conn = endpoint.openConnection() as HttpURLConnection
+            conn = endpoint.openConnection() as HttpURLConnection
             conn.requestMethod = "GET"
             conn.connectTimeout = 4000
             conn.readTimeout = 4000
@@ -391,9 +391,11 @@ open class WebSearchClient {
             } else {
                 emptyList()
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.w(TAG, "[$TAG] DDG HTML query failed for '$query'", e)
             emptyList()
+        } finally {
+            try { conn?.disconnect() } catch (_: Throwable) {}
         }
     }
 
@@ -424,9 +426,10 @@ open class WebSearchClient {
      * Bing Web Search endpoint (tertiary fallback).
      */
     fun fetchBingWeb(query: String, maxResults: Int): List<SearchResult> {
+        var conn: HttpURLConnection? = null
         return try {
             val endpoint = URL("https://www.bing.com/search?q=" + URLEncoder.encode(query, "UTF-8"))
-            val conn = endpoint.openConnection() as HttpURLConnection
+            conn = endpoint.openConnection() as HttpURLConnection
             conn.requestMethod = "GET"
             conn.connectTimeout = 4000
             conn.readTimeout = 4000
@@ -440,9 +443,11 @@ open class WebSearchClient {
             } else {
                 emptyList()
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.w(TAG, "[$TAG] Bing web query failed for '$query'", e)
             emptyList()
+        } finally {
+            try { conn?.disconnect() } catch (_: Throwable) {}
         }
     }
 
@@ -500,7 +505,7 @@ open class WebSearchClient {
     /**
      * Ranks search candidates by keyword presence, exact phrase matches, and domain quality.
      */
-    private fun rankByRelevance(
+    open fun rankByRelevance(
         results: List<SearchResult>,
         cleanQuery: String,
         maxResults: Int,
@@ -515,7 +520,10 @@ open class WebSearchClient {
         val seenTitles = mutableSetOf<String>()
         val scoredList = mutableListOf<Pair<SearchResult, Int>>()
 
-        for (res in results) {
+        val nonStopwords = queryTokens.filter { it !in setOf("who", "is", "what", "where", "tell", "about", "details", "info", "the", "profile", "profiles") }
+        val namePhrase = nonStopwords.joinToString(" ")
+
+        for ((index, res) in results.withIndex()) {
             val normalizedUrl = res.url.trimEnd('/')
             val normTitle = res.title.lowercase().replace(Regex("""[^a-z0-9]"""), "")
             if (normalizedUrl in seenUrls || normTitle in seenTitles) continue
@@ -523,17 +531,32 @@ open class WebSearchClient {
             val titleClean = res.title.lowercase().replace(Regex("""[^a-z0-9\s]"""), " ")
             val snipClean = res.snippet.lowercase().replace(Regex("""[^a-z0-9\s]"""), " ")
 
-            // Base score
-            var score = 10
+            // Base score derived from original search engine rank (preserves Google/SerpApi authority)
+            var score = (results.size - index) * 12
 
             // Exact phrase match bonus
-            if (titleClean.contains(queryLower)) score += 50
-            if (snipClean.contains(queryLower)) score += 30
+            if (queryLower.isNotBlank() && titleClean.contains(queryLower)) score += 50
+            if (queryLower.isNotBlank() && snipClean.contains(queryLower)) score += 25
+
+            // Name phrase matching for entity/person queries
+            if (namePhrase.isNotBlank() && namePhrase.length >= 3) {
+                if (titleClean.contains(namePhrase)) score += 40
+                if (snipClean.contains(namePhrase)) score += 20
+            }
 
             // Token overlap scoring
+            var matchedTokens = 0
             for (token in queryTokens) {
-                if (titleClean.contains(token)) score += 15
-                if (snipClean.contains(token)) score += 8
+                val inTitle = titleClean.contains(token)
+                val inSnip = snipClean.contains(token)
+                if (inTitle || inSnip) matchedTokens++
+                if (inTitle) score += 12
+                if (inSnip) score += 6
+            }
+
+            // For multi-word queries (e.g. 3+ tokens), penalize results matching only 1 token
+            if (queryTokens.size >= 3 && matchedTokens <= 1 && !titleClean.contains(queryLower)) {
+                score -= 40
             }
 
             // High-authority encyclopedic / reference platforms get top priority for general queries
@@ -541,11 +564,66 @@ open class WebSearchClient {
             when {
                 urlLower.contains("wikipedia.org") -> score += if (isProduct) -15 else 35
                 urlLower.contains("imdb.com") -> score += if (isProduct) -15 else 30
-                urlLower.contains("linkedin.com") -> score += if (isProduct) -15 else 20
-                urlLower.contains("github.com") -> score += if (isProduct) -15 else 20
+                urlLower.contains("linkedin.com/in/") -> {
+                    if (isProduct) {
+                        score -= 15
+                    } else {
+                        score += 25
+                        val profileText = (titleClean + " " + snipClean).lowercase()
+                        val handle = res.url.substringAfter("/in/").substringBefore("/").substringBefore("?").trim()
+                        val isRollNumberHandle = handle.matches(Regex("""^(?:ap|reg|[a-z]{2})\d{6,}$""", RegexOption.IGNORE_CASE)) ||
+                                handle.matches(Regex("""^\d{6,}$"""))
+
+                        // Detect and penalize empty stub profiles or college registration roll-number stubs
+                        val isStubProfile = isRollNumberHandle ||
+                                titleClean.contains("attended ") ||
+                                (snipClean.contains("view ") && snipClean.contains("profile on linkedin") &&
+                                 !profileText.contains("manager") && !profileText.contains("engineer") &&
+                                 !profileText.contains("developer") && !profileText.contains("years") &&
+                                 !profileText.contains("founder") && !profileText.contains("lead"))
+
+                        if (isRollNumberHandle) {
+                            score -= 60 // Heavy penalty so dummy/roll-number student stubs never override authentic profiles
+                        } else if (isStubProfile) {
+                            score -= 35
+                        }
+
+                        // Boost active profiles with real roles, education, or demonstrated career experience
+                        val hasRealRolesOrCreds = profileText.contains("manager") || profileText.contains("director") ||
+                                profileText.contains("lead") || profileText.contains("executive") ||
+                                profileText.contains("developer") || profileText.contains("engineer") ||
+                                profileText.contains("software") || profileText.contains("founder") ||
+                                profileText.contains("ceo") || profileText.contains("cto") ||
+                                profileText.contains("vp") || profileText.contains("consultant") ||
+                                profileText.contains("analyst") || profileText.contains("specialist") ||
+                                profileText.contains("architect") || profileText.contains("designer") ||
+                                profileText.contains("scientist") || profileText.contains("researcher") ||
+                                profileText.contains("professor") || profileText.contains("doctor") ||
+                                profileText.contains("advocate") || profileText.contains("lawyer") ||
+                                profileText.contains("president") || profileText.contains("officer") ||
+                                profileText.contains("student") || profileText.contains("graduate") ||
+                                profileText.contains("alumni") || profileText.contains("university") ||
+                                profileText.contains("college") || profileText.contains("institute") ||
+                                profileText.contains("b.tech") || profileText.contains("m.tech") ||
+                                profileText.contains("phd") || profileText.contains("years") ||
+                                profileText.contains("experience") || profileText.contains("industry")
+
+                        if (hasRealRolesOrCreds && !isStubProfile && !isRollNumberHandle) {
+                            score += 25
+                        }
+                    }
+                }
+                urlLower.contains("linkedin.com/posts/") -> {
+                    score -= 35
+                }
+                urlLower.contains("linkedin.com/pub/dir/") || urlLower.contains("linkedin.com/pulse/") || urlLower.contains("linkedin.com/search/") -> {
+                    score -= 50
+                }
+                urlLower.contains("linkedin.com") -> score += if (isProduct) -15 else 10
+                urlLower.contains("github.com") -> score += if (isProduct) -15 else 25
                 urlLower.contains("huggingface.co") -> score += 20
                 urlLower.contains("gov") || urlLower.contains("edu") -> score += 20
-                urlLower.contains("instagram.com") || urlLower.contains("facebook.com") -> score -= 10
+                urlLower.contains("instagram.com") || urlLower.contains("facebook.com") -> score -= 15
             }
 
             if (isProduct) {

@@ -12,12 +12,18 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.ime
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.res.painterResource
+import com.teja.gemmmobile.R
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.rememberTextMeasurer
 import com.teja.gemmmobile.ocr.DocumentOcrHelper
 import com.teja.gemmmobile.ocr.ExtractedDocument
 import com.teja.gemmmobile.search.SearchResult
@@ -54,14 +60,20 @@ import androidx.compose.foundation.layout.imeNestedScroll
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.layout.layoutId
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -95,6 +107,10 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -243,6 +259,19 @@ fun ChatScreen(
     var activeUserMenuMessage by remember { mutableStateOf<ChatMessage?>(null) }
     var showCameraOverlay by remember { mutableStateOf(false) }
     var showAddFilesSheet by remember { mutableStateOf(false) }
+    var showAppIntro by remember { mutableStateOf(true) }
+    var showModelInfoSheet by remember { mutableStateOf(false) }
+
+    // Let the local model load on its own worker thread while the UI is already
+    // usable. This avoids opening to a technical CPU/loading screen.
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(1050)
+        showAppIntro = false
+    }
+
+    if (showAppIntro && installState is ModelInstallState.Installed) {
+        AppIntroOverlay()
+    }
 
     val haptic = LocalHapticFeedback.current
     val keyboardController = LocalSoftwareKeyboardController.current
@@ -252,8 +281,12 @@ fun ChatScreen(
     var inputDockHeightPx by remember { mutableIntStateOf(0) }
     val density = LocalDensity.current
     val navBarBottomDp = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+    val imeBottomDp = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
+    val isKeyboardOpen = isImeVisible || imeBottomDp > 0.dp
+    val bottomInsetsDp = maxOf(navBarBottomDp, imeBottomDp)
+    val effectiveBottomInset = bottomInsetsDp
     val inputDockHeightDp = with(density) {
-        if (inputDockHeightPx > 0) inputDockHeightPx.toDp() else 74.dp
+        if (inputDockHeightPx > 0) inputDockHeightPx.toDp() else 68.dp
     }
 
     val sessions by viewModel.sessions.collectAsState()
@@ -337,6 +370,38 @@ fun ChatScreen(
                 } finally {
                     isOcrProcessing = false
                 }
+            }
+        }
+    }
+
+    // Chat-style file picker: users can select a small batch of documents and ask
+    // one question about all of them. The on-device prompt is kept compact below.
+    val multiDocumentPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris: List<Uri> ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        scope.launch {
+            isOcrProcessing = true
+            try {
+                val documents = withContext(Dispatchers.IO) {
+                    uris.take(5).map { uri ->
+                        val mime = context.contentResolver.getType(uri).orEmpty()
+                        when {
+                            mime == "application/pdf" || uri.toString().endsWith(".pdf", ignoreCase = true) ->
+                                DocumentOcrHelper.processPdfUri(context, uri)
+                            mime.startsWith("image/") -> DocumentOcrHelper.processImageUri(context, uri)
+                            else -> DocumentOcrHelper.processTextUri(context, uri)
+                        }
+                    }
+                }
+                val attachment = combineDocumentsForChat(documents)
+                viewModel.attachDocument(attachment)
+                val label = if (documents.size == 1) attachment.fileName else "${documents.size} files"
+                Toast.makeText(context, "Attached $label", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Toast.makeText(context, "Error reading files: ${e.message}", Toast.LENGTH_LONG).show()
+            } finally {
+                isOcrProcessing = false
             }
         }
     }
@@ -651,6 +716,35 @@ fun ChatScreen(
         )
     }
 
+    if (showModelInfoSheet) {
+        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        ModalBottomSheet(
+            onDismissRequest = { showModelInfoSheet = false },
+            sheetState = sheetState,
+            containerColor = Color(0xFF1E1E22),
+            dragHandle = {
+                Box(
+                    modifier = Modifier
+                        .padding(top = 10.dp, bottom = 12.dp)
+                        .size(width = 36.dp, height = 4.dp)
+                        .clip(CircleShape)
+                        .background(Color(0xFF48484E))
+                )
+            }
+        ) {
+            ModelInfoSheetContent(
+                engineState = engineState,
+                isWebSearchEnabled = isWebSearchEnabled,
+                onToggleWebSearch = { viewModel.toggleWebSearch() },
+                onOpenSettings = {
+                    showModelInfoSheet = false
+                    showSettingsPage = true
+                },
+                onDismiss = { showModelInfoSheet = false }
+            )
+        }
+    }
+
     if (showDeleteConfirmDialog) {
         AlertDialog(
             onDismissRequest = { showDeleteConfirmDialog = false },
@@ -717,7 +811,7 @@ fun ChatScreen(
                 modifier = Modifier
                     .width(320.dp)
                     .fillMaxHeight(),
-                drawerContainerColor = currentTheme.surface
+                drawerContainerColor = Color(0xFF171717)
             ) {
                 RecentChatsDrawer(
                     sessions = sessions,
@@ -789,35 +883,6 @@ fun ChatScreen(
                     )
                 }
 
-                engineState is EngineState.Uninitialized || engineState is EngineState.Loading -> {
-                    Box(
-                        modifier = Modifier.fillMaxSize(),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.Center,
-                            modifier = Modifier.padding(24.dp)
-                        ) {
-                            Text("✨", fontSize = 48.sp)
-                            Spacer(modifier = Modifier.height(20.dp))
-                            CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
-                            Spacer(modifier = Modifier.height(16.dp))
-                            Text(
-                                text = if (engineState is EngineState.Loading) (engineState as EngineState.Loading).message else "Loading Gemma 4…",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = "Private • On-device • No internet needed",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.outline
-                            )
-                        }
-                    }
-                }
-
                 engineState is EngineState.Error -> {
                     val errorState = engineState as EngineState.Error
                     Box(
@@ -877,103 +942,74 @@ fun ChatScreen(
 
                 else -> {
                     // Chat Interface - Full-Page Edge-to-Edge with Vignette Transparency
-                    if (messages.isEmpty()) {
-                        EmptyChatHero(
-                            onPromptSelected = { prompt ->
-                                viewModel.onInputTextChanged(prompt)
-                                viewModel.sendMessage()
-                            },
-                            onExamineSelected = {
-                                imagePickerLauncher.launch("image/*")
-                            }
-                        )
-                    } else {
-                        val onSpeakStable = remember(viewModel) {
-                            { id: String, text: String -> viewModel.toggleSpeak(id, text) }
-                        }
-                        val onShareStable = remember(context) {
-                            { text: String -> ExportHelper.shareMessage(context, text) }
-                        }
-                        val onRegenerateStable = remember(viewModel) {
-                            { viewModel.regenerateLastResponse() }
-                        }
-                        val onLongPressUserMessageStable = remember {
-                            { msg: ChatMessage -> activeUserMenuMessage = msg }
-                        }
-
-                        LazyColumn(
-                            state = listState,
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .nestedScroll(pullToNewChatConnection)
-                                .graphicsLayer {
-                                    translationY = -pullOffsetAnim.value * 0.45f
+                    Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = Alignment.TopCenter
+                    ) {
+                        if (messages.isEmpty()) {
+                            EmptyChatHero(
+                                onPromptSelected = { prompt ->
+                                    viewModel.onInputTextChanged(prompt)
+                                    viewModel.sendMessage()
                                 },
-                            contentPadding = PaddingValues(
-                                start = 16.dp,
-                                end = 16.dp,
-                                top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 58.dp,
-                                bottom = navBarBottomDp + inputDockHeightDp + 24.dp
-                            ),
-                            verticalArrangement = Arrangement.spacedBy(16.dp)
-                        ) {
-                            items(messages, key = { it.id }) { message ->
-                                MessageBubble(
-                                    message = message,
-                                    isSpeaking = isSpeaking && currentlySpeakingId == message.id,
-                                    onSpeak = onSpeakStable,
-                                    onShare = onShareStable,
-                                    onRegenerate = onRegenerateStable,
-                                    onLongPressUserMessage = onLongPressUserMessageStable
-                                )
+                                onExamineSelected = {
+                                    imagePickerLauncher.launch("image/*")
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .widthIn(max = 840.dp)
+                            )
+                        } else {
+                            val onSpeakStable = remember(viewModel) {
+                                { id: String, text: String -> viewModel.toggleSpeak(id, text) }
+                            }
+                            val onShareStable = remember(context) {
+                                { text: String -> ExportHelper.shareMessage(context, text) }
+                            }
+                            val onExportPdfStable = remember(context, scope) {
+                                { text: String -> ExportHelper.exportMessageAsPdf(context, text, null, scope) }
+                            }
+                            val onRegenerateStable = remember(viewModel) {
+                                { viewModel.regenerateLastResponse() }
+                            }
+                            val onLongPressUserMessageStable = remember {
+                                { msg: ChatMessage -> activeUserMenuMessage = msg }
                             }
 
-                            val lastMsg = messages.lastOrNull()
-                            val lastContent = (if (lastMsg?.text?.isNotBlank() == true) lastMsg.text else lastMsg?.thoughtText.orEmpty()).trim()
-                            if (!isGenerating && lastMsg?.role == MessageRole.ASSISTANT && lastContent.isNotBlank()) {
-                                item(key = "follow_up_chips") {
-                                    val followUps = remember(lastMsg.id, lastContent) {
-                                        extractFollowUpSuggestions(lastContent)
-                                    }
-                                    if (followUps.isNotEmpty()) {
-                                        LazyRow(
-                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .padding(vertical = 4.dp)
-                                        ) {
-                                            items(followUps) { chip ->
-                                                ChatGptSurfaceButton(
-                                                    onClick = {
-                                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                                        val promptToSend = if (chip.equals("Continue generating", ignoreCase = true)) {
-                                                            "Continue from where you left off"
-                                                        } else {
-                                                            chip
-                                                        }
-                                                        viewModel.onInputTextChanged(promptToSend)
-                                                        viewModel.sendMessage()
-                                                    },
-                                                    shape = RoundedCornerShape(16.dp),
-                                                    color = Color(0xFF212121),
-                                                    border = BorderStroke(1.dp, Color(0xFF2E2E2E)),
-                                                    shadowElevation = 1.dp
-                                                ) {
-                                                    Text(
-                                                        text = chip,
-                                                        style = MaterialTheme.typography.labelMedium,
-                                                        color = Color(0xFFECECEC),
-                                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-                                                    )
-                                                }
-                                            }
-                                        }
-                                    }
+                            LazyColumn(
+                                state = listState,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .widthIn(max = 840.dp)
+                                    .fillMaxHeight()
+                                    .nestedScroll(pullToNewChatConnection)
+                                    .graphicsLayer {
+                                        translationY = -pullOffsetAnim.value * 0.45f
+                                    },
+                                contentPadding = PaddingValues(
+                                    start = 16.dp,
+                                    end = 16.dp,
+                                    top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 58.dp,
+                                    bottom = effectiveBottomInset + inputDockHeightDp + 16.dp
+                                ),
+                                verticalArrangement = Arrangement.spacedBy(16.dp)
+                            ) {
+                                items(messages, key = { it.id }) { message ->
+                                    MessageBubble(
+                                        message = message,
+                                        isSpeaking = isSpeaking && currentlySpeakingId == message.id,
+                                        onSpeak = onSpeakStable,
+                                        onShare = onShareStable,
+                                        onExportPdf = { text -> viewModel.generatePdfForMessage(message.id, text) },
+                                        onRegenerate = onRegenerateStable,
+                                        onFeedback = { feedback -> viewModel.setResponseFeedback(message.id, feedback) },
+                                        onLongPressUserMessage = onLongPressUserMessageStable
+                                    )
                                 }
-                            }
 
-                            item(key = "bottom_anchor") {
-                                Spacer(modifier = Modifier.height(16.dp))
+                                item(key = "bottom_anchor") {
+                                    Spacer(modifier = Modifier.height(16.dp))
+                                }
                             }
                         }
                     }
@@ -1004,120 +1040,104 @@ fun ChatScreen(
                 )
 
                 // Floating Action Bar Row
+                // Floating Action Bar Row - ChatGPT 1:1 ConversationTopBar
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .statusBarsPadding()
-                        .padding(horizontal = 14.dp, vertical = 6.dp),
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // Left: Solid Circular Hamburger Button ( = )
-                    Surface(
-                        shape = CircleShape,
-                        color = currentTheme.surface,
-                        border = BorderStroke(1.dp, currentTheme.border),
-                        modifier = Modifier
-                            .size(38.dp)
-                            .clip(CircleShape)
-                            .liquidBounceClick(scaleDown = 0.90f) {
-                                scope.launch { drawerState.open() }
-                            }
+                    // Left: Bare Hamburger Menu Button (ChatGPT MenuIconButton)
+                    IconButton(
+                        onClick = {
+                            scope.launch { drawerState.open() }
+                        },
+                        modifier = Modifier.size(42.dp)
                     ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(
-                                imageVector = Icons.Default.Menu,
-                                contentDescription = "Open drawer",
-                                tint = Color(0xFFECECEC),
-                                modifier = Modifier.size(19.dp)
-                            )
-                        }
+                        Icon(
+                            imageVector = Icons.Default.Menu,
+                            contentDescription = "Open drawer",
+                            tint = Color(0xFFCDCDCD),
+                            modifier = Modifier.size(24.dp)
+                        )
                     }
 
-                    // Center: Subtle Gemma title & status badge
+                    // Center: ChatGPT ConversationTopBarTitleStack (Title + Chevron)
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.Center
+                        horizontalArrangement = Arrangement.Center,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                showModelInfoSheet = true
+                            }
+                            .padding(horizontal = 8.dp, vertical = 6.dp)
                     ) {
                         Text(
                             text = "Gemma",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            color = Color(0xFFECECEC)
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontSize = 17.sp,
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 0.sp
+                            ),
+                            color = Color.White
                         )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        BackendBadge(engineState = engineState)
+                        Spacer(modifier = Modifier.width(3.dp))
+                        Icon(
+                            imageVector = Icons.Default.KeyboardArrowDown,
+                            contentDescription = "Model select",
+                            tint = Color(0xFF8E8E93),
+                            modifier = Modifier.size(18.dp)
+                        )
                     }
 
-                    // Right: Floating Pill Container [ ✎  |  ⋮ ]
-                    var showTopMenu by remember { mutableStateOf(false) }
-                    Box {
-                        Surface(
-                            shape = RoundedCornerShape(20.dp),
-                            color = currentTheme.surface,
-                            border = BorderStroke(1.dp, currentTheme.border),
-                            modifier = Modifier.height(38.dp)
+                    // Right: Bare ChatGPT Action Buttons (New Chat + 3-Dots Menu)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(0.dp)
+                    ) {
+                        // New Chat Button (ConversationTopBarNewChatButton)
+                        IconButton(
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                viewModel.createNewChat()
+                            },
+                            modifier = Modifier.size(42.dp)
                         ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.padding(horizontal = 4.dp)
-                            ) {
-                                // New Chat Pencil Icon
-                                Box(
-                                    modifier = Modifier
-                                        .size(34.dp)
-                                        .clip(CircleShape)
-                                        .liquidBounceClick(scaleDown = 0.88f) {
-                                            viewModel.createNewChat()
-                                        },
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Edit,
-                                        contentDescription = "New chat",
-                                        tint = Color(0xFFECECEC),
-                                        modifier = Modifier.size(17.dp)
-                                    )
-                                }
-
-                                Spacer(modifier = Modifier.width(2.dp))
-                                Box(
-                                    modifier = Modifier
-                                        .width(1.dp)
-                                        .height(16.dp)
-                                        .background(Color(0x33FFFFFF))
-                                        .clip(CircleShape)
-                                )
-                                Spacer(modifier = Modifier.width(2.dp))
-
-                                // 3-Dots More Options Icon
-                                Box(
-                                    modifier = Modifier
-                                        .size(34.dp)
-                                        .clip(CircleShape)
-                                        .liquidBounceClick(scaleDown = 0.88f) {
-                                            showTopMenu = true
-                                        },
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.MoreVert,
-                                        contentDescription = "More options",
-                                        tint = Color(0xFFECECEC),
-                                        modifier = Modifier.size(19.dp)
-                                    )
-                                }
-                            }
+                            Icon(
+                                imageVector = Icons.Default.Edit,
+                                contentDescription = "New chat",
+                                tint = Color(0xFFCDCDCD),
+                                modifier = Modifier.size(22.dp)
+                            )
                         }
 
-                        // Floating dropdown menu anchored directly to the pill
-                        DropdownMenu(
-                            expanded = showTopMenu,
-                            onDismissRequest = { showTopMenu = false },
-                            modifier = Modifier
-                                .background(Color(0xF014141C))
-                                .border(0.8.dp, Color(0x30FFFFFF), RoundedCornerShape(14.dp))
-                        ) {
+                        // 3-Dots More Options Menu (ConversationTopBarIconButton)
+                        var showTopMenu by remember { mutableStateOf(false) }
+                        Box {
+                            IconButton(
+                                onClick = { showTopMenu = true },
+                                modifier = Modifier.size(42.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.MoreVert,
+                                    contentDescription = "More options",
+                                    tint = Color(0xFFCDCDCD),
+                                    modifier = Modifier.size(22.dp)
+                                )
+                            }
+
+                            // Dark Solid ChatGPT Dropdown Menu (#212121 surface, #323232 border)
+                            DropdownMenu(
+                                expanded = showTopMenu,
+                                onDismissRequest = { showTopMenu = false },
+                                modifier = Modifier
+                                    .background(Color(0xFF212121))
+                                    .border(1.dp, Color(0xFF323232), RoundedCornerShape(14.dp))
+                            ) {
                             DropdownMenuItem(
                                 text = { Text("Settings", color = Color.White, fontWeight = FontWeight.Medium) },
                                 leadingIcon = {
@@ -1173,6 +1193,18 @@ fun ChatScreen(
                                     }
                                 )
                                 DropdownMenuItem(
+                                    text = { Text("Export as PDF", color = Color.White) },
+                                    leadingIcon = {
+                                        Icon(painter = painterResource(id = R.drawable.ic_chatgpt_pdf), contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
+                                    },
+                                    onClick = {
+                                        showTopMenu = false
+                                        viewModel.getCurrentSession()?.let { session ->
+                                            ExportHelper.exportSessionAsPdf(context, session, scope)
+                                        }
+                                    }
+                                )
+                                DropdownMenuItem(
                                     text = { Text("Rename", color = Color.White) },
                                     leadingIcon = {
                                         Icon(Icons.Default.DriveFileRenameOutline, contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
@@ -1198,8 +1230,9 @@ fun ChatScreen(
                     }
                 }
             }
+        }
 
-            // Top Error Banner (floating under top bar)
+        // Top Error Banner (floating under top bar)
             AnimatedVisibility(
                 visible = errorMessage != null,
                 enter = fadeIn(),
@@ -1227,6 +1260,9 @@ fun ChatScreen(
                                 modifier = Modifier.weight(1f)
                             )
                             Spacer(modifier = Modifier.width(8.dp))
+                            TextButton(onClick = { viewModel.retryLastResponse() }) {
+                                Text("Retry", color = MaterialTheme.colorScheme.onErrorContainer)
+                            }
                             TextButton(onClick = { viewModel.dismissError() }) {
                                 Text("Dismiss", color = MaterialTheme.colorScheme.onErrorContainer)
                             }
@@ -1289,7 +1325,7 @@ fun ChatScreen(
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(inputDockHeightDp + navBarBottomDp + 36.dp)
+                        .height(inputDockHeightDp + effectiveBottomInset + 16.dp)
                         .align(Alignment.BottomCenter)
                         .background(
                             Brush.verticalGradient(
@@ -1302,13 +1338,12 @@ fun ChatScreen(
                         )
                 )
 
-                // 3. Floating Input Dock and Actions (safely padded above system navigation bar)
+                // 3. Floating Input Dock and Actions (safely padded above system navigation bar & keyboard)
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .align(Alignment.BottomCenter)
-                        .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Bottom))
-                        .padding(bottom = 8.dp)
+                        .padding(bottom = effectiveBottomInset + 6.dp)
                 ) {
 
                     // Independent Floating ChatGPT style Memory Updated Notification
@@ -1419,14 +1454,15 @@ fun ChatScreen(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
                             .onGloballyPositioned { coordinates ->
-                                inputDockHeightPx = coordinates.size.height
+                                if (Math.abs(inputDockHeightPx - coordinates.size.height) > 3) {
+                                    inputDockHeightPx = coordinates.size.height
+                                }
                             }
                     )
                 }
             }
         }
     }
-}
 
     // Floating Attachment Popup Menu (matching ChatGPT AMOLED pure dark screenshot)
     if (showAttachmentMenu) {
@@ -1467,8 +1503,7 @@ fun ChatScreen(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Bottom))
-                .padding(start = 18.dp, bottom = 68.dp),
+                .padding(start = 18.dp, bottom = inputDockHeightDp + effectiveBottomInset + 12.dp),
             contentAlignment = Alignment.BottomStart
         ) {
             Surface(
@@ -1550,7 +1585,7 @@ fun ChatScreen(
         visible = showAddFilesSheet,
         onDismiss = { showAddFilesSheet = false },
         onUploadFiles = {
-            docPickerLauncher.launch(arrayOf("*/*"))
+            multiDocumentPickerLauncher.launch(arrayOf("application/pdf", "text/plain", "text/*", "image/*"))
         },
         onFileSelected = { doc ->
             viewModel.attachDocument(doc)
@@ -1559,6 +1594,8 @@ fun ChatScreen(
         recentFiles = recentFiles
     )
 }
+}
+
 
 @Composable
 fun RecentChatsDrawer(
@@ -1610,7 +1647,7 @@ fun RecentChatsDrawer(
             .fillMaxSize()
             .statusBarsPadding()
             .navigationBarsPadding()
-            .background(Color(0xF5101016))
+            .background(Color(0xFF171717))
             .padding(horizontal = 16.dp, vertical = 12.dp)
     ) {
         // Top Header
@@ -1649,8 +1686,8 @@ fun RecentChatsDrawer(
 
         Surface(
             shape = RoundedCornerShape(12.dp),
-            color = Color(0x661E1E28),
-            border = BorderStroke(0.8.dp, Color(0x28FFFFFF)),
+            color = Color(0xFF212121),
+            border = BorderStroke(1.dp, Color(0xFF2E2E2E)),
             modifier = Modifier
                 .fillMaxWidth()
                 .height(40.dp)
@@ -1960,24 +1997,87 @@ private fun DrawerShortcutRow(
 }
 
 @Composable
+private fun AppIntroOverlay() {
+    val transition = rememberInfiniteTransition(label = "appIntro")
+    val glowScale by transition.animateFloat(
+        initialValue = 0.92f,
+        targetValue = 1.08f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(700, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "introGlowScale"
+    )
+
+    Dialog(
+        onDismissRequest = {},
+        properties = DialogProperties(
+            dismissOnBackPress = false,
+            dismissOnClickOutside = false,
+            usePlatformDefaultWidth = false
+        )
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0xFF07070A)),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Surface(
+                    shape = CircleShape,
+                    color = Color(0xFF102D24),
+                    border = BorderStroke(1.dp, Color(0xFF1D8F70)),
+                    modifier = Modifier
+                        .size(82.dp)
+                        .graphicsLayer {
+                            scaleX = glowScale
+                            scaleY = glowScale
+                        }
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Text("✦", color = Color(0xFF66E1BD), fontSize = 38.sp)
+                    }
+                }
+                Spacer(modifier = Modifier.height(22.dp))
+                Text(
+                    text = "Gemma",
+                    color = Color.White,
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "Private AI, ready when you are",
+                    color = Color(0xFF9D9DA5),
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        }
+    }
+}
+
+@Composable
 fun EmptyChatHero(
     onPromptSelected: (String) -> Unit,
-    onExamineSelected: () -> Unit = {}
+    onExamineSelected: () -> Unit = {},
+    modifier: Modifier = Modifier
 ) {
-    val currentTheme = LocalChatTheme.current
     val navBottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+    val haptic = LocalHapticFeedback.current
+
     Column(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxSize()
             .padding(
-                start = 18.dp,
-                end = 18.dp,
+                start = 16.dp,
+                end = 16.dp,
                 top = 28.dp,
-                bottom = navBottom + 84.dp
+                bottom = navBottom + 76.dp
             ),
         verticalArrangement = Arrangement.SpaceBetween
     ) {
-        // Centered subtle greeting / logo
+        // Centered ChatGPT-style greeting and emblem
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1987,149 +2087,73 @@ fun EmptyChatHero(
         ) {
             Surface(
                 shape = CircleShape,
-                color = currentTheme.surface,
-                border = BorderStroke(1.dp, currentTheme.border),
-                modifier = Modifier.size(62.dp)
+                color = Color(0xFF212121),
+                border = BorderStroke(1.dp, Color(0xFF323232)),
+                modifier = Modifier.size(64.dp)
             ) {
                 Box(contentAlignment = Alignment.Center) {
-                    Text(text = "✦", fontSize = 28.sp, color = Color(0xFF10A37F))
+                    Text(text = "✦", fontSize = 32.sp, color = Color(0xFFFA70AB))
                 }
             }
 
-            Spacer(modifier = Modifier.height(18.dp))
+            Spacer(modifier = Modifier.height(20.dp))
 
             Text(
                 text = "What can I help with?",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold,
+                style = MaterialTheme.typography.titleLarge.copy(
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.SemiBold
+                ),
                 color = Color.White
             )
 
             Spacer(modifier = Modifier.height(6.dp))
 
             Text(
-                text = "On-device • 100% Private • Multimodal",
+                text = "On-device • 100% Private • Gemma 2B",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF8E8E98)
+                color = Color(0xFF8E8E93)
             )
         }
 
-        // Sleek 2x2 Prompt Cards (ChatGPT style)
-        Column(
+        // Horizontal scrolling suggestion pills (ConversationComposerPill - ect0.java, ivm.java)
+        val suggestions = listOf(
+            "✦ Create image" to "Generate a creative high-definition illustration of a cybernetic fox in neon city",
+            "📄 Summarize text" to "Summarize the key takeaways and actionable points of modern quantum computing",
+            "💻 Code in Kotlin" to "Write a clean Kotlin coroutine pipeline with Flow and StateFlow error handling",
+            "✍️ Help me write" to "Draft a polite and persuasive proposal for implementing local on-device AI",
+            "🌐 Search web" to "What are the latest breakthroughs in open-source generative AI this week?"
+        )
+
+        LazyRow(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(bottom = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+                .padding(bottom = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            contentPadding = PaddingValues(horizontal = 2.dp)
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                // Card 1: Examine image or document
-                GlassHeroCard(
-                    modifier = Modifier.weight(1f),
-                    icon = Icons.Default.Image,
-                    iconBg = Color(0x2E06B6D4),
-                    iconTint = Color(0xFF22D3EE),
-                    title = "Analyze media",
-                    subtitle = "Photos & docs",
-                    onClick = onExamineSelected
-                )
-
-                // Card 2: Code & technical
-                GlassHeroCard(
-                    modifier = Modifier.weight(1f),
-                    icon = Icons.Default.AutoAwesome,
-                    iconBg = Color(0x2E10A37F),
-                    iconTint = Color(0xFF34D399),
-                    title = "Code & debug",
-                    subtitle = "Kotlin, Python",
-                    onClick = { onPromptSelected("Help me write and optimize a clean algorithm in Kotlin") }
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                // Card 3: Write & explain
-                GlassHeroCard(
-                    modifier = Modifier.weight(1f),
-                    icon = Icons.Default.Edit,
-                    iconBg = Color(0x2E8B5CF6),
-                    iconTint = Color(0xFFA78BFA),
-                    title = "Draft & write",
-                    subtitle = "Summaries & essays",
-                    onClick = { onPromptSelected("Summarize key machine learning concepts with a clear analogy") }
-                )
-
-                // Card 4: Web Search
-                GlassHeroCard(
-                    modifier = Modifier.weight(1f),
-                    icon = Icons.Default.Language,
-                    iconBg = Color(0x2EF59E0B),
-                    iconTint = Color(0xFFFBBF24),
-                    title = "Live search",
-                    subtitle = "Web intelligence",
-                    onClick = { onPromptSelected("What are the latest breakthroughs in on-device AI?") }
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun GlassHeroCard(
-    modifier: Modifier = Modifier,
-    icon: ImageVector,
-    iconBg: Color,
-    iconTint: Color,
-    title: String,
-    subtitle: String,
-    onClick: () -> Unit
-) {
-    val currentTheme = LocalChatTheme.current
-    Surface(
-        shape = RoundedCornerShape(18.dp),
-        color = currentTheme.surface,
-        border = BorderStroke(1.dp, currentTheme.border),
-        modifier = modifier
-            .clip(RoundedCornerShape(18.dp))
-            .liquidBounceClick(scaleDown = 0.96f, onClick = onClick)
-    ) {
-        Column(
-            modifier = Modifier.padding(13.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(32.dp)
-                    .clip(CircleShape)
-                    .background(iconBg),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    imageVector = icon,
-                    contentDescription = null,
-                    tint = iconTint,
-                    modifier = Modifier.size(17.dp)
-                )
-            }
-            Column {
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.SemiBold,
-                    color = Color.White
-                )
-                Spacer(modifier = Modifier.height(2.dp))
-                Text(
-                    text = subtitle,
-                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
-                    color = Color(0xFF8E8E98),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+            items(suggestions) { (label, prompt) ->
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = Color(0xFF212121),
+                    border = BorderStroke(1.dp, Color(0xFF323232)),
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(20.dp))
+                        .clickable {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onPromptSelected(prompt)
+                        }
+                ) {
+                    Text(
+                        text = label,
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Medium
+                        ),
+                        color = Color(0xFFECECEC),
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                    )
+                }
             }
         }
     }
@@ -2183,7 +2207,9 @@ fun MessageBubble(
     isSpeaking: Boolean = false,
     onSpeak: (String, String) -> Unit = { _, _ -> },
     onShare: (String) -> Unit = {},
+    onExportPdf: (String) -> Unit = {},
     onRegenerate: () -> Unit = {},
+    onFeedback: (ResponseFeedback) -> Unit = {},
     onLongPressUserMessage: (ChatMessage) -> Unit = {}
 ) {
     val isUser = message.role == MessageRole.USER
@@ -2217,41 +2243,28 @@ fun MessageBubble(
             horizontalArrangement = Arrangement.End,
             verticalAlignment = Alignment.Bottom
         ) {
-            IconButton(
-                onClick = {
-                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                    onLongPressUserMessage(message)
-                },
-                modifier = Modifier
-                    .size(28.dp)
-                    .padding(end = 4.dp, bottom = 2.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Edit,
-                    contentDescription = "Edit prompt",
-                    tint = Color(0xFFAAAAAA),
-                    modifier = Modifier.size(15.dp)
-                )
-            }
+
 
             val currentDisplayBitmap = displayBitmap
-            Surface(
-                shape = RoundedCornerShape(20.dp),
-                color = LocalChatTheme.current.userBubble,
-                border = BorderStroke(0.8.dp, LocalChatTheme.current.border),
-                modifier = Modifier
-                    .widthIn(max = 295.dp)
-                    .clip(RoundedCornerShape(20.dp))
-                    .combinedClickable(
-                        onClick = {
-                            onLongPressUserMessage(message)
-                        },
-                        onLongClick = {
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            onLongPressUserMessage(message)
-                        }
-                    )
-            ) {
+            BoxWithConstraints {
+                val maxBubbleWidth = (maxWidth * 0.85f).coerceIn(240.dp, 560.dp)
+                Surface(
+                    shape = RoundedCornerShape(18.dp),
+                    color = Color(0xFF2F2F2F),
+                    border = null,
+                    modifier = Modifier
+                        .widthIn(min = 40.dp, max = maxBubbleWidth)
+                        .clip(RoundedCornerShape(18.dp))
+                        .combinedClickable(
+                            onClick = {
+                                onLongPressUserMessage(message)
+                            },
+                            onLongClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                onLongPressUserMessage(message)
+                            }
+                        )
+                ) {
                 Column(
                     modifier = Modifier.padding(
                         if (currentDisplayBitmap != null && message.text.isBlank()) 4.dp
@@ -2327,7 +2340,8 @@ fun MessageBubble(
                 }
             }
         }
-    } else {
+    }
+} else {
         // ── ASSISTANT: clean ChatGPT style (no avatar header, pure text aligned to left) ──
         Column(
             modifier = Modifier
@@ -2381,13 +2395,33 @@ fun MessageBubble(
                 Spacer(modifier = Modifier.height(8.dp))
             }
 
+            var showSourcesSheet by remember { mutableStateOf(false) }
+            var selectedSearchImage by remember { mutableStateOf<SearchImage?>(null) }
+
+            if (selectedSearchImage != null) {
+                InAppImagePreviewDialog(
+                    image = selectedSearchImage!!,
+                    onDismiss = { selectedSearchImage = null }
+                )
+            }
+
             // ChatGPT "Searched N sites" collapsible accordion (matching media_1791402016025.jpg)
             if (message.isSearchingWeb) {
                 ChatGptSearchingWebPill()
                 Spacer(modifier = Modifier.height(10.dp))
             } else if (message.searchResults.isNotEmpty()) {
                 ChatGptSearchedSitesPill(
-                    searchResults = message.searchResults
+                    searchResults = message.searchResults,
+                    onClick = { showSourcesSheet = true }
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+            }
+
+            // ChatGPT / Perplexity Style Images Carousel for visual and image search queries
+            if (message.searchImages.isNotEmpty()) {
+                SearchImagesCarousel(
+                    images = message.searchImages,
+                    onImageClick = { selectedSearchImage = it }
                 )
                 Spacer(modifier = Modifier.height(10.dp))
             }
@@ -2421,8 +2455,7 @@ fun MessageBubble(
                         MarkdownText(text = preamble, isUser = false, searchResults = message.searchResults)
                         Spacer(modifier = Modifier.height(8.dp))
                     }
-                    EmailDraftBox(draftText = body)
-                } else if (effectiveText.contains(":::product", ignoreCase = true)) {
+                } else if (!message.isStreaming && effectiveText.contains(":::product", ignoreCase = true)) {
                     val productSegments = remember(effectiveText, message.searchImages, message.searchResults) {
                         parseProductMessageSegments(effectiveText, message.searchImages, message.searchResults)
                     }
@@ -2445,46 +2478,7 @@ fun MessageBubble(
                 }
             }
 
-                // Fallback Product Recommendation Cards (when model outputted text/bullets and not :::product tags)
-                val hasInlineProducts = effectiveText.contains(":::product", ignoreCase = true)
-                val fallbackProductCards = if (!hasInlineProducts && !message.isStreaming && effectiveText.isNotEmpty() && message.searchResults.isNotEmpty()) {
-                    remember(message.searchResults, message.searchImages) {
-                        extractFallbackProductCards(message.searchResults, message.searchImages)
-                    }
-                } else emptyList()
 
-                if (fallbackProductCards.isNotEmpty()) {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    ProductCardsList(cards = fallbackProductCards)
-                }
-
-                // Search Images Carousel & In-App Preview (ChatGPT style)
-                // Only show if no product cards were rendered to avoid duplicate images
-                val hasAnyProductCards = hasInlineProducts || fallbackProductCards.isNotEmpty()
-                var previewImage by remember { mutableStateOf<SearchImage?>(null) }
-                if (message.searchImages.isNotEmpty() && !hasAnyProductCards) {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    SearchImagesCarousel(
-                        images = message.searchImages,
-                        onImageClick = { img ->
-                            previewImage = img
-                        }
-                    )
-                }
-                if (previewImage != null) {
-                    InAppImagePreviewDialog(
-                        image = previewImage!!,
-                        onDismiss = { previewImage = null }
-                    )
-                }
-
-                // Profile & Link Cards (ChatGPT interactive cards with Open Profile action)
-                if (!message.isStreaming && effectiveText.isNotEmpty() && message.searchResults.isNotEmpty()) {
-                    val profileCards = remember(message.searchResults) { extractProfileCards(message.searchResults) }
-                    if (profileCards.isNotEmpty()) {
-                        ProfileCardsRow(cards = profileCards)
-                    }
-                }
 
                 // Document Citations Badge (Google AI Edge Gallery / NotebookLM style)
                 if (!message.isStreaming && message.citedPages.isNotEmpty()) {
@@ -2516,9 +2510,34 @@ fun MessageBubble(
                     }
                 }
 
+                // Generated PDF Document Card (Study notes / document attachment card)
+                if (!message.isStreaming && message.generatedPdfPath != null) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    GeneratedPdfDocumentCard(
+                        title = message.generatedPdfTitle ?: "Document.pdf",
+                        pageCount = message.generatedPdfPageCount,
+                        filePath = message.generatedPdfPath!!,
+                        onOpen = {
+                            val file = java.io.File(message.generatedPdfPath!!)
+                            if (file.exists()) {
+                                com.teja.gemmmobile.pdf.PdfExporter.openPdf(context, file)
+                            } else {
+                                Toast.makeText(context, "PDF file not found", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        onShare = {
+                            val file = java.io.File(message.generatedPdfPath!!)
+                            if (file.exists()) {
+                                com.teja.gemmmobile.pdf.PdfExporter.sharePdf(context, file, message.generatedPdfTitle ?: "Document")
+                            } else {
+                                Toast.makeText(context, "PDF file not found", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    )
+                }
+
                 // Action bar — only after streaming done (matching media_1791402016025.jpg)
                 if (!message.isStreaming && effectiveText.isNotEmpty()) {
-                    var showSourcesSheet by remember { mutableStateOf(false) }
                     Spacer(modifier = Modifier.height(10.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -2554,14 +2573,15 @@ fun MessageBubble(
                                     .size(28.dp)
                                     .clip(CircleShape)
                                     .liquidBounceClick(scaleDown = 0.85f, alphaDown = 0.75f) {
-                                        Toast.makeText(context, "Good response", Toast.LENGTH_SHORT).show()
+                                        onFeedback(ResponseFeedback.POSITIVE)
+                                        Toast.makeText(context, "Feedback saved", Toast.LENGTH_SHORT).show()
                                     },
                                 contentAlignment = Alignment.Center
                             ) {
                                 Icon(
-                                    imageVector = Icons.Default.ThumbUp,
+                                    painter = painterResource(id = R.drawable.ic_chatgpt_thumb_up),
                                     contentDescription = "Good response",
-                                    tint = Color(0xFF8E8E93),
+                                    tint = if (message.feedback == ResponseFeedback.POSITIVE) Color(0xFF10A37F) else Color(0xFF8E8E93),
                                     modifier = Modifier.size(15.dp)
                                 )
                             }
@@ -2571,14 +2591,15 @@ fun MessageBubble(
                                     .size(28.dp)
                                     .clip(CircleShape)
                                     .liquidBounceClick(scaleDown = 0.85f, alphaDown = 0.75f) {
-                                        Toast.makeText(context, "Bad response", Toast.LENGTH_SHORT).show()
+                                        onFeedback(ResponseFeedback.NEGATIVE)
+                                        Toast.makeText(context, "Feedback saved", Toast.LENGTH_SHORT).show()
                                     },
                                 contentAlignment = Alignment.Center
                             ) {
                                 Icon(
-                                    imageVector = Icons.Default.ThumbDown,
+                                    painter = painterResource(id = R.drawable.ic_chatgpt_thumb_down),
                                     contentDescription = "Bad response",
-                                    tint = Color(0xFF8E8E93),
+                                    tint = if (message.feedback == ResponseFeedback.NEGATIVE) Color(0xFFF43F5E) else Color(0xFF8E8E93),
                                     modifier = Modifier.size(15.dp)
                                 )
                             }
@@ -2592,12 +2613,21 @@ fun MessageBubble(
                                     },
                                 contentAlignment = Alignment.Center
                             ) {
-                                Icon(
-                                    imageVector = if (isSpeaking) Icons.Default.Stop else Icons.Default.VolumeUp,
-                                    contentDescription = if (isSpeaking) "Stop reading" else "Read aloud",
-                                    tint = Color(0xFF8E8E93),
-                                    modifier = Modifier.size(16.dp)
-                                )
+                                if (isSpeaking) {
+                                    Icon(
+                                        painter = painterResource(id = R.drawable.ic_chatgpt_stop),
+                                        contentDescription = "Stop reading",
+                                        tint = Color(0xFF8E8E93),
+                                        modifier = Modifier.size(15.dp)
+                                    )
+                                } else {
+                                    Icon(
+                                        painter = painterResource(id = R.drawable.ic_chatgpt_read_aloud),
+                                        contentDescription = "Read aloud",
+                                        tint = Color(0xFF8E8E93),
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
                             }
                             // Share
                             Box(
@@ -2610,8 +2640,25 @@ fun MessageBubble(
                                 contentAlignment = Alignment.Center
                             ) {
                                 Icon(
-                                    imageVector = Icons.Default.Share,
+                                    painter = painterResource(id = R.drawable.ic_chatgpt_share),
                                     contentDescription = "Share",
+                                    tint = Color(0xFF8E8E93),
+                                    modifier = Modifier.size(15.dp)
+                                )
+                            }
+                            // Export as PDF
+                            Box(
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .clip(CircleShape)
+                                    .liquidBounceClick(scaleDown = 0.85f, alphaDown = 0.75f) {
+                                        onExportPdf(effectiveText)
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    painter = painterResource(id = R.drawable.ic_chatgpt_pdf),
+                                    contentDescription = "Export as PDF",
                                     tint = Color(0xFF8E8E93),
                                     modifier = Modifier.size(15.dp)
                                 )
@@ -2627,7 +2674,7 @@ fun MessageBubble(
                                 contentAlignment = Alignment.Center
                             ) {
                                 Icon(
-                                    imageVector = Icons.Default.Refresh,
+                                    painter = painterResource(id = R.drawable.ic_chatgpt_regenerate),
                                     contentDescription = "Regenerate response",
                                     tint = Color(0xFF8E8E93),
                                     modifier = Modifier.size(16.dp)
@@ -2644,17 +2691,164 @@ fun MessageBubble(
                                     showSourcesSheet = true
                                 }
                             )
-                            SourcesBottomSheet(
-                                visible = showSourcesSheet,
-                                searchResults = message.searchResults,
-                                onDismiss = { showSourcesSheet = false }
-                            )
                         }
                     }
+                }
+
+                if (message.searchResults.isNotEmpty()) {
+                    SourcesBottomSheet(
+                        visible = showSourcesSheet,
+                        searchResults = message.searchResults,
+                        onDismiss = { showSourcesSheet = false }
+                    )
                 }
             }
         }
     }
+
+@Composable
+fun GeneratedPdfDocumentCard(
+    title: String,
+    pageCount: Int,
+    filePath: String,
+    onOpen: () -> Unit,
+    onShare: () -> Unit
+) {
+    val haptic = LocalHapticFeedback.current
+    val cleanTitle = if (title.endsWith(".pdf", ignoreCase = true)) title else "$title.pdf"
+    val pagesLabel = if (pageCount > 1) "$pageCount Pages" else "1 Page"
+
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp)),
+        color = Color(0xFF1E2128),
+        border = BorderStroke(1.dp, Color(0xFF2E333D))
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // PDF Icon badge with crimson accent box
+                Box(
+                    modifier = Modifier
+                        .size(38.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Color(0xFF2D1517)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        painter = painterResource(id = R.drawable.ic_chatgpt_pdf),
+                        contentDescription = "PDF Document",
+                        tint = Color(0xFFEF4444),
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(12.dp))
+
+                // Title & Metadata
+                Column(
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(
+                        text = cleanTitle,
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 13.5.sp
+                        ),
+                        color = Color.White,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = "$pagesLabel • Study Notes PDF • Ready",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontSize = 11.sp
+                        ),
+                        color = Color(0xFF94A3B8)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Action buttons row: [ Open PDF ] & [ Share ]
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // Open Document button
+                Button(
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onOpen()
+                    },
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(34.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF2A2E39),
+                        contentColor = Color.White
+                    ),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp)
+                ) {
+                    Icon(
+                        painter = painterResource(id = R.drawable.ic_chatgpt_pdf),
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp),
+                        tint = Color(0xFF60A5FA)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Open PDF",
+                        style = MaterialTheme.typography.labelMedium.copy(
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 12.sp
+                        )
+                    )
+                }
+
+                // Share button
+                Button(
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onShare()
+                    },
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(34.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF10A37F).copy(alpha = 0.15f),
+                        contentColor = Color(0xFF10A37F)
+                    ),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp)
+                ) {
+                    Icon(
+                        painter = painterResource(id = R.drawable.ic_chatgpt_share),
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp),
+                        tint = Color(0xFF10A37F)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Share",
+                        style = MaterialTheme.typography.labelMedium.copy(
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 12.sp
+                        )
+                    )
+                }
+            }
+        }
+    }
+}
 
 // Dynamic, alive ChatGPT-style working indicator (never feels stuck)
 @Composable
@@ -3055,10 +3249,12 @@ fun DomainFaviconBadge(
 
     LaunchedEffect(url) {
         if (faviconBmp == null) {
-            val bmp = com.teja.gemmmobile.search.FaviconLoader.loadFavicon(url)
-            if (bmp != null) {
-                faviconBmp = bmp
-            }
+            try {
+                val bmp = com.teja.gemmmobile.search.FaviconLoader.loadFavicon(url)
+                if (bmp != null) {
+                    faviconBmp = bmp
+                }
+            } catch (_: Throwable) {}
         }
     }
 
@@ -3105,9 +3301,18 @@ fun DomainFaviconBadge(
         contentAlignment = Alignment.Center
     ) {
         val bmp = faviconBmp
-        if (bmp != null) {
+        val imgBitmap = remember(bmp) {
+            if (bmp != null && !bmp.isRecycled && bmp.width > 0 && bmp.height > 0) {
+                try {
+                    bmp.asImageBitmap()
+                } catch (_: Throwable) {
+                    null
+                }
+            } else null
+        }
+        if (imgBitmap != null) {
             androidx.compose.foundation.Image(
-                bitmap = bmp.asImageBitmap(),
+                bitmap = imgBitmap,
                 contentDescription = host,
                 modifier = Modifier
                     .fillMaxSize()
@@ -3626,14 +3831,16 @@ fun ProductImageThumbnail(
 
     LaunchedEffect(imageUrl, pageUrl) {
         if (thumbBitmap == null) {
-            withContext(Dispatchers.IO) {
-                val bmp = if (!imageUrl.isNullOrBlank()) {
-                    ProfileAvatarLoader.loadImage(imageUrl)
-                } else if (pageUrl.isNotBlank()) {
-                    ProfileAvatarLoader.loadAvatar(pageUrl)
-                } else null
-                thumbBitmap = bmp
-            }
+            try {
+                withContext(Dispatchers.IO) {
+                    val bmp = if (!imageUrl.isNullOrBlank()) {
+                        ProfileAvatarLoader.loadImage(imageUrl)
+                    } else if (pageUrl.isNotBlank()) {
+                        ProfileAvatarLoader.loadAvatar(pageUrl)
+                    } else null
+                    thumbBitmap = bmp
+                }
+            } catch (_: Throwable) {}
         }
     }
 
@@ -3799,10 +4006,12 @@ fun ProfileAvatarBadge(
 
     LaunchedEffect(url) {
         if (avatarBmp == null) {
-            val bmp = ProfileAvatarLoader.loadAvatar(url)
-            if (bmp != null) {
-                avatarBmp = bmp
-            }
+            try {
+                val bmp = ProfileAvatarLoader.loadAvatar(url)
+                if (bmp != null) {
+                    avatarBmp = bmp
+                }
+            } catch (_: Throwable) {}
         }
     }
 
@@ -3972,7 +4181,7 @@ fun ChatGptSearchingWebPill() {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
-                imageVector = Icons.Default.Language,
+                painter = painterResource(id = R.drawable.ic_chatgpt_globe),
                 contentDescription = null,
                 tint = Color(0xFF10A37F),
                 modifier = Modifier
@@ -3992,7 +4201,8 @@ fun ChatGptSearchingWebPill() {
 
 @Composable
 fun ChatGptSearchedSitesPill(
-    searchResults: List<SearchResult>
+    searchResults: List<SearchResult>,
+    onClick: (() -> Unit)? = null
 ) {
     var expanded by remember { mutableStateOf(false) }
     val context = LocalContext.current
@@ -4003,7 +4213,13 @@ fun ChatGptSearchedSitesPill(
         border = BorderStroke(1.dp, Color(0xFF2B2B30)),
         modifier = Modifier
             .clip(RoundedCornerShape(14.dp))
-            .clickable { expanded = !expanded }
+            .clickable {
+                if (onClick != null) {
+                    onClick()
+                } else {
+                    expanded = !expanded
+                }
+            }
             .padding(vertical = 2.dp)
     ) {
         Column(
@@ -4033,7 +4249,7 @@ fun ChatGptSearchedSitesPill(
                     }
                 } else {
                     Icon(
-                        imageVector = Icons.Default.Language,
+                        painter = painterResource(id = R.drawable.ic_chatgpt_globe),
                         contentDescription = null,
                         tint = Color(0xFF10A37F),
                         modifier = Modifier.size(14.dp)
@@ -4143,6 +4359,114 @@ fun ChatGptSourcesPill(
     }
 }
 
+@Composable
+fun InlineSourceCitations(
+    searchResults: List<SearchResult>,
+    searchImages: List<SearchImage> = emptyList()
+) {
+    val context = LocalContext.current
+    if (searchResults.isEmpty()) return
+
+    LazyRow(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 10.dp, bottom = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = PaddingValues(horizontal = 2.dp)
+    ) {
+        items(searchResults.take(6)) { result ->
+            val domain = remember(result.url) { extractDomain(result.url).ifBlank { "Source" } }
+            val cardImageUrl = remember(result.url, result.imageUrl, searchImages) {
+                result.imageUrl ?: searchImages.firstOrNull { img ->
+                    img.sourceUrl == result.url ||
+                    (domain.isNotBlank() && extractDomain(img.sourceUrl) == domain)
+                }?.imageUrl
+            }
+            var cardBitmap by remember(cardImageUrl) {
+                mutableStateOf(cardImageUrl?.let { ProfileAvatarLoader.getCachedImage(it) })
+            }
+            LaunchedEffect(cardImageUrl) {
+                if (cardImageUrl != null && cardBitmap == null) {
+                    try {
+                        withContext(Dispatchers.IO) {
+                            val bmp = ProfileAvatarLoader.loadImage(cardImageUrl)
+                            cardBitmap = bmp
+                        }
+                    } catch (_: Throwable) {}
+                }
+            }
+
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = Color(0xFF1E1E22),
+                border = BorderStroke(1.dp, Color(0xFF2E2E36)),
+                modifier = Modifier
+                    .widthIn(min = 140.dp, max = 210.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable {
+                        try {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(result.url)))
+                        } catch (_: Exception) {
+                            Toast.makeText(context, "Unable to open source", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            DomainFaviconBadge(url = result.url, size = 16.dp)
+                            Text(
+                                text = domain,
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontSize = 11.5.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                ),
+                                color = Color(0xFFE2E2E6),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        if (result.title.isNotBlank()) {
+                            Spacer(modifier = Modifier.height(3.dp))
+                            Text(
+                                text = result.title.trim(),
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    fontSize = 11.sp,
+                                    lineHeight = 14.sp
+                                ),
+                                color = Color(0xFF9E9EA4),
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+
+                    if (cardBitmap != null) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        androidx.compose.foundation.Image(
+                            bitmap = cardBitmap!!.asImageBitmap(),
+                            contentDescription = result.title,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .size(38.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(Color(0xFF28282E))
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ==========================================
 // ChatGPT-Style Web Search Images & Carousel
 // ==========================================
@@ -4178,15 +4502,23 @@ fun SearchImageThumbnail(
     image: SearchImage,
     onClick: () -> Unit
 ) {
-    var thumbBitmap by remember(image.imageUrl) {
-        mutableStateOf<Bitmap?>(ProfileAvatarLoader.getCachedImage(image.imageUrl))
+    val effectiveUrl = remember(image.imageUrl, image.thumbnailUrl) {
+        image.thumbnailUrl.ifBlank { image.imageUrl }
     }
-    LaunchedEffect(image.imageUrl) {
+    var thumbBitmap by remember(effectiveUrl) {
+        mutableStateOf<Bitmap?>(ProfileAvatarLoader.getCachedImage(effectiveUrl))
+    }
+    LaunchedEffect(effectiveUrl) {
         if (thumbBitmap == null) {
-            withContext(Dispatchers.IO) {
-                val bmp = ProfileAvatarLoader.loadImage(image.imageUrl)
-                thumbBitmap = bmp
-            }
+            try {
+                withContext(Dispatchers.IO) {
+                    var bmp = ProfileAvatarLoader.loadImage(effectiveUrl)
+                    if (bmp == null && image.imageUrl.isNotBlank() && effectiveUrl != image.imageUrl) {
+                        bmp = ProfileAvatarLoader.loadImage(image.imageUrl)
+                    }
+                    thumbBitmap = bmp
+                }
+            } catch (_: Throwable) {}
         }
     }
 
@@ -4276,16 +4608,26 @@ fun InAppImagePreviewDialog(
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
-    var fullBitmap by remember(image.imageUrl) {
-        mutableStateOf<Bitmap?>(ProfileAvatarLoader.getCachedImage(image.imageUrl))
+    val effectivePreviewUrl = remember(image.imageUrl, image.thumbnailUrl) {
+        image.imageUrl.ifBlank { image.thumbnailUrl }
     }
-    var isLoading by remember(image.imageUrl) { mutableStateOf(fullBitmap == null) }
+    var fullBitmap by remember(effectivePreviewUrl) {
+        mutableStateOf<Bitmap?>(ProfileAvatarLoader.getCachedImage(effectivePreviewUrl))
+    }
+    var isLoading by remember(effectivePreviewUrl) { mutableStateOf(fullBitmap == null) }
 
-    LaunchedEffect(image.imageUrl) {
+    LaunchedEffect(effectivePreviewUrl) {
         if (fullBitmap == null) {
-            withContext(Dispatchers.IO) {
-                val bmp = ProfileAvatarLoader.downloadBitmap(image.imageUrl, maxDimension = 1280)
-                fullBitmap = bmp
+            try {
+                withContext(Dispatchers.IO) {
+                    var bmp = ProfileAvatarLoader.downloadBitmap(effectivePreviewUrl, maxDimension = 1280)
+                    if (bmp == null && image.thumbnailUrl.isNotBlank() && effectivePreviewUrl != image.thumbnailUrl) {
+                        bmp = ProfileAvatarLoader.downloadBitmap(image.thumbnailUrl, maxDimension = 1280)
+                    }
+                    fullBitmap = bmp
+                    isLoading = false
+                }
+            } catch (_: Throwable) {
                 isLoading = false
             }
         }
@@ -4636,7 +4978,7 @@ fun SourcesBottomSheet(
 }
 
 private enum class ActionButtonState {
-    MIC,
+    VOICE,
     SEND,
     STOP
 }
@@ -4659,6 +5001,12 @@ private fun ChatInputDock(
     val inputText by viewModel.inputText.collectAsState()
     val haptic = LocalHapticFeedback.current
     val keyboardController = LocalSoftwareKeyboardController.current
+    val composerStatus = when (engineState) {
+        is EngineState.Loading -> engineState.message
+        is EngineState.Uninitialized -> "Model is not ready yet"
+        is EngineState.Error -> "Model unavailable — retry from the error message"
+        else -> null
+    }
 
     Column(
         modifier = modifier
@@ -4816,334 +5164,476 @@ fun ChatInputBar(
     showAttachmentMenu: Boolean = false
 ) {
     val focusManager = LocalFocusManager.current
-    val isImeVisible = WindowInsets.isImeVisible
-    var isFocused by remember { mutableStateOf(false) }
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val focusRequester = remember { FocusRequester() }
 
-    // Whenever keyboard is closed/dismissed and input is empty, clear focus
-    LaunchedEffect(isImeVisible) {
-        if (!isImeVisible && inputText.isEmpty()) {
+    val density = LocalDensity.current
+    val imeBottomDp = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
+    val isKeyboardOpen = WindowInsets.isImeVisible || imeBottomDp > 0.dp
+
+    var isFocused by remember { mutableStateOf(false) }
+    var isMaximized by remember { mutableStateOf(false) }
+
+    var wasKeyboardOpen by remember { mutableStateOf(false) }
+
+    // When the soft keyboard closes, clear focus immediately so the bar shrinks back to unclicked 80% state
+    LaunchedEffect(isKeyboardOpen) {
+        if (isKeyboardOpen) {
+            wasKeyboardOpen = true
+        } else if (wasKeyboardOpen) {
             focusManager.clearFocus()
             isFocused = false
+            wasKeyboardOpen = false
         }
     }
-
-    var lineCount by remember { mutableIntStateOf(1) }
-    var isMaximized by remember { mutableStateOf(false) }
 
     LaunchedEffect(inputText.isEmpty()) {
         if (inputText.isEmpty()) {
             isMaximized = false
-            lineCount = 1
         }
     }
 
-    val isMultiLine = lineCount > 1 || inputText.contains('\n') || inputText.length > 40 || attachedDocument != null || isMaximized
-
-    // Dynamic Expansion: 85% width when idle, 95% width when clicked/focused/typing like ChatGPT
-    val isFocusedOrActive = isFocused || isImeVisible || inputText.isNotEmpty() || hasAttachment || isMultiLine
-    val targetWidthFraction = if (isFocusedOrActive) 0.95f else 0.85f
-
-    val animatedWidthFraction by animateFloatAsState(
-        targetValue = targetWidthFraction,
-        animationSpec = spring(
-            dampingRatio = 0.82f,
-            stiffness = Spring.StiffnessMediumLow
-        ),
-        label = "inputWidthFraction"
-    )
-
-    // ChatGPT smooth morph: Circular pill (28.dp) when single-line, rounded card (22.dp) when multi-line (matching screenshot)
-    val cornerRadius by animateDpAsState(
-        targetValue = if (isMultiLine) 22.dp else 28.dp,
-        animationSpec = spring(
-            dampingRatio = 0.80f,
-            stiffness = Spring.StiffnessMediumLow
-        ),
-        label = "inputCornerRadius"
-    )
-
-    val currentTheme = LocalChatTheme.current
-
-    val plusRotation by animateFloatAsState(
-        targetValue = if (showAttachmentMenu) 45f else 0f,
-        animationSpec = spring(
-            dampingRatio = 0.72f,
-            stiffness = Spring.StiffnessMedium
-        ),
-        label = "plusRotation"
-    )
-
-    // Floating Pill Island Surface (Solid ChatGPT Style)
-    Surface(
-        shape = RoundedCornerShape(cornerRadius),
-        color = currentTheme.surface,
-        border = BorderStroke(1.dp, currentTheme.border),
-        shadowElevation = 8.dp,
-        modifier = Modifier
-            .fillMaxWidth(animatedWidthFraction)
-            .animateContentSize(
-                animationSpec = spring(
-                    dampingRatio = Spring.DampingRatioNoBouncy,
-                    stiffness = Spring.StiffnessMedium
-                )
-            )
+    BoxWithConstraints(
+        modifier = Modifier.fillMaxWidth(),
+        contentAlignment = Alignment.Center
     ) {
-        Column(
+        val totalWidthPx = constraints.maxWidth
+
+        // Dynamic Width Expansion: 80% width when idle/unfocused/keyboard closed, 95% width when focused/typing (ChatGPT style)
+        val isFocusedOrActive = isFocused || isKeyboardOpen || isMaximized || attachedDocument != null || showAttachmentMenu
+        val targetWidthFraction = if (isFocusedOrActive) 0.95f else 0.80f
+        val animatedWidthFraction by animateFloatAsState(
+            targetValue = targetWidthFraction,
+            animationSpec = spring(
+                dampingRatio = 0.82f,
+                stiffness = Spring.StiffnessMediumLow
+            ),
+            label = "inputWidthFraction"
+        )
+
+        // Threshold width for single-line text field:
+        val singleLineTextMaxWidthPx = remember(totalWidthPx, density, isWebSearchEnabled, animatedWidthFraction) {
+            with(density) {
+                val currentWidthPx = (totalWidthPx * animatedWidthFraction).toInt()
+                val reservedDp = 24.dp + 42.dp + 42.dp + 8.dp + (if (isWebSearchEnabled) 75.dp else 0.dp)
+                val calculated = currentWidthPx - reservedDp.roundToPx()
+                calculated.coerceAtLeast(140.dp.roundToPx())
+            }
+        }
+        val hysteresisPx = remember(density) {
+            with(density) { 14.dp.roundToPx() }
+        }
+
+        val textMeasurer = rememberTextMeasurer()
+        val textStyle = TextStyle(
+            fontSize = 16.sp,
+            color = Color.White,
+            lineHeight = 22.sp,
+            fontFamily = FontFamily.Default
+        )
+
+        var isMultiLineState by remember { mutableStateOf(false) }
+
+        val isMultiLine = remember(inputText, attachedDocument, isMaximized, singleLineTextMaxWidthPx) {
+            if (isMaximized || attachedDocument != null || inputText.contains('\n')) {
+                isMultiLineState = true
+                true
+            } else if (inputText.isEmpty()) {
+                isMultiLineState = false
+                false
+            } else {
+                val measuredWidth = textMeasurer.measure(
+                    text = AnnotatedString(inputText),
+                    style = textStyle
+                ).size.width
+
+                if (measuredWidth > singleLineTextMaxWidthPx) {
+                    isMultiLineState = true
+                    true
+                } else if (measuredWidth < (singleLineTextMaxWidthPx - hysteresisPx)) {
+                    isMultiLineState = false
+                    false
+                } else {
+                    isMultiLineState
+                }
+            }
+        }
+
+        // Dynamic Action State: VOICE (when idle/empty), SEND (when text/file present), STOP (when generating)
+        val actionState = when {
+            isGenerating -> ActionButtonState.STOP
+            inputText.isNotBlank() || hasAttachment -> ActionButtonState.SEND
+            else -> ActionButtonState.VOICE
+        }
+
+        // ChatGPT smooth morph: Circular capsule (26.dp) when single-line, rounded card (20.dp) when multi-line (ect0.a = 22.dp)
+        val cornerRadius by animateDpAsState(
+            targetValue = if (isMultiLine) 20.dp else 26.dp,
+            animationSpec = spring(
+                dampingRatio = 0.82f,
+                stiffness = Spring.StiffnessMediumLow
+            ),
+            label = "inputCornerRadius"
+        )
+
+        val plusRotation by animateFloatAsState(
+            targetValue = if (showAttachmentMenu) 45f else 0f,
+            animationSpec = spring(
+                dampingRatio = 0.72f,
+                stiffness = Spring.StiffnessMedium
+            ),
+            label = "plusRotation"
+        )
+
+        // Solid ChatGPT Dark Bottom Input Bar Container (ytc.C: #FF212121 surface, #FF323232 border)
+        Surface(
+            shape = RoundedCornerShape(cornerRadius),
+            color = Color(0xFF212121),
+            border = BorderStroke(1.dp, Color(0xFF323232)),
+            shadowElevation = 4.dp,
+            modifier = Modifier
+                .fillMaxWidth(animatedWidthFraction)
+                .padding(vertical = 2.dp)
+                .animateContentSize(
+                    animationSpec = spring(
+                        dampingRatio = 0.82f,
+                        stiffness = Spring.StiffnessMediumLow
+                    )
+                )
+        ) {
+        ChatInputBarLayout(
+            isMultiLine = isMultiLine,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 6.dp, vertical = 6.dp)
-        ) {
-            // Uploaded Image / Document Preview INSIDE Chatbox (ChatGPT style)
-            if (attachedDocument != null) {
-                val doc = attachedDocument
-                if (doc.isImage && doc.previewBitmap != null) {
-                    Box(
-                        modifier = Modifier
-                            .padding(start = 6.dp, top = 2.dp, bottom = 6.dp)
-                            .size(64.dp)
-                    ) {
-                        androidx.compose.foundation.Image(
-                            painter = androidx.compose.ui.graphics.painter.BitmapPainter(doc.previewBitmap.asImageBitmap()),
-                            contentDescription = "Attached image",
+                .padding(horizontal = 6.dp, vertical = if (isMultiLine) 6.dp else 4.dp),
+            attachmentContent = if (attachedDocument != null) {
+                {
+                    val doc = attachedDocument
+                    if (doc.isImage && doc.previewBitmap != null) {
+                        Box(
                             modifier = Modifier
-                                .size(60.dp)
-                                .align(Alignment.BottomStart)
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(Color(0xFF2A2A2A)),
-                            contentScale = ContentScale.Crop
-                        )
-                        Surface(
-                            shape = CircleShape,
-                            color = Color(0xDD000000),
-                            border = BorderStroke(1.dp, Color(0x44FFFFFF)),
-                            modifier = Modifier
-                                .size(20.dp)
-                                .align(Alignment.TopEnd)
-                                .clip(CircleShape)
-                                .clickable { onRemoveAttachment() }
+                                .padding(start = 6.dp, top = 2.dp, bottom = 4.dp)
+                                .size(64.dp)
                         ) {
-                            Box(contentAlignment = Alignment.Center) {
-                                Icon(
-                                    imageVector = Icons.Default.Close,
-                                    contentDescription = "Remove attachment",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(11.dp)
-                                )
+                            androidx.compose.foundation.Image(
+                                painter = androidx.compose.ui.graphics.painter.BitmapPainter(doc.previewBitmap.asImageBitmap()),
+                                contentDescription = "Attached image",
+                                modifier = Modifier
+                                    .size(60.dp)
+                                    .align(Alignment.BottomStart)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(Color(0xFF2A2A2A)),
+                                contentScale = ContentScale.Crop
+                            )
+                            Surface(
+                                shape = CircleShape,
+                                color = Color(0xDD000000),
+                                border = BorderStroke(1.dp, Color(0x44FFFFFF)),
+                                modifier = Modifier
+                                    .size(20.dp)
+                                    .align(Alignment.TopEnd)
+                                    .clip(CircleShape)
+                                    .clickable { onRemoveAttachment() }
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(
+                                        imageVector = Icons.Default.Close,
+                                        contentDescription = "Remove attachment",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(11.dp)
+                                    )
+                                }
                             }
                         }
-                    }
-                } else {
-                    val isPdf = doc.fileName.endsWith(".pdf", ignoreCase = true)
-                    Surface(
-                        shape = RoundedCornerShape(14.dp),
-                        color = Color(0x662A2A38),
-                        border = BorderStroke(0.8.dp, Color(0x2EFFFFFF)),
-                        modifier = Modifier.padding(start = 6.dp, top = 2.dp, bottom = 6.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    } else {
+                        val isPdf = doc.fileName.endsWith(".pdf", ignoreCase = true)
+                        Surface(
+                            shape = RoundedCornerShape(14.dp),
+                            color = Color(0x662A2A38),
+                            border = BorderStroke(0.8.dp, Color(0x2EFFFFFF)),
+                            modifier = Modifier.padding(start = 6.dp, top = 2.dp, bottom = 4.dp)
                         ) {
-                            Icon(
-                                imageVector = if (isPdf) Icons.Default.PictureAsPdf else Icons.Default.Description,
-                                contentDescription = null,
-                                tint = if (isPdf) Color(0xFFFF857D) else Color(0xFF66D9B8),
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Text(
-                                text = doc.fileName,
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Medium,
-                                color = Color.White,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.widthIn(max = 180.dp)
-                            )
-                            Box(
-                                modifier = Modifier
-                                    .size(18.dp)
-                                    .clip(CircleShape)
-                                    .background(Color(0xFF383840))
-                                    .clickable { onRemoveAttachment() },
-                                contentAlignment = Alignment.Center
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 Icon(
-                                    imageVector = Icons.Default.Close,
-                                    contentDescription = "Remove",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(11.dp)
+                                    imageVector = if (isPdf) Icons.Default.PictureAsPdf else Icons.Default.Description,
+                                    contentDescription = null,
+                                    tint = if (isPdf) Color(0xFFFF857D) else Color(0xFF66D9B8),
+                                    modifier = Modifier.size(16.dp)
                                 )
+                                Text(
+                                    text = doc.fileName,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Medium,
+                                    color = Color.White,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.widthIn(max = 180.dp)
+                                )
+                                Box(
+                                    modifier = Modifier
+                                        .size(18.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFF383840))
+                                        .clickable { onRemoveAttachment() },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Close,
+                                        contentDescription = "Remove",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(11.dp)
+                                    )
+                                }
                             }
                         }
                     }
                 }
-            }
-
-            if (isMultiLine) {
-                // =========================================================================
-                // MULTI-LINE EXPANDED CARD LAYOUT (EXACTLY MATCHING USER'S SCREENSHOT)
-                // =========================================================================
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 6.dp, vertical = 2.dp)
-                ) {
-                    // Web search badge if active
-                    if (isWebSearchEnabled) {
-                        Surface(
-                            shape = RoundedCornerShape(12.dp),
-                            color = Color(0x3310A37F),
-                            border = BorderStroke(1.dp, Color(0x6610A37F)),
-                            modifier = Modifier
-                                .height(26.dp)
-                                .padding(bottom = 4.dp)
-                                .clip(RoundedCornerShape(12.dp))
-                                .clickable { onToggleWebSearch() }
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Language,
-                                    contentDescription = "Search the web",
-                                    modifier = Modifier.size(12.dp),
-                                    tint = Color(0xFF10A37F)
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text(
-                                    text = "Web Search Active",
-                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = Color(0xFF10A37F)
-                                )
-                            }
-                        }
-                    }
-
-                    // Full-width Text Area on TOP
-                    Box(
+            } else null,
+            webBadgeContent = if (isWebSearchEnabled) {
+                {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = Color(0x2810A37F),
+                        border = BorderStroke(1.dp, Color(0x5510A37F)),
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 44.dp, max = if (isMaximized) 320.dp else 170.dp)
-                            .padding(start = 4.dp, end = 4.dp, top = 4.dp, bottom = 6.dp)
+                            .padding(start = 2.dp, bottom = if (isMultiLine) 4.dp else 0.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .liquidBounceClick(scaleDown = 0.94f) { onToggleWebSearch() }
                     ) {
-                        BasicTextField(
-                            value = inputText,
-                            onValueChange = onTextChanged,
-                            enabled = isEnabled && !isGenerating,
-                            onTextLayout = { lineCount = it.lineCount },
-                            textStyle = TextStyle(
-                                fontSize = 16.sp,
-                                color = Color.White,
-                                lineHeight = 22.sp,
-                                fontFamily = FontFamily.Default
-                            ),
-                            cursorBrush = SolidColor(Color.White),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .onFocusChanged { isFocused = it.isFocused },
-                            decorationBox = { innerTextField ->
-                                Box(modifier = Modifier.fillMaxWidth()) {
-                                    if (inputText.isEmpty()) {
-                                        Text(
-                                            text = if (isWebSearchEnabled) "Search with Gemma..." else "Ask Gemma...",
-                                            style = MaterialTheme.typography.bodyMedium.copy(
-                                                fontSize = 16.sp,
-                                                color = Color(0xFF8E8E93)
-                                            )
-                                        )
-                                    }
-                                    innerTextField()
-                                }
-                            }
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(2.dp))
-
-                    // Dedicated Bottom Controls Row (Matching Screenshot: [+] on left, [⤢][🎤][(↑)] on right)
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(start = 2.dp, end = 2.dp, top = 2.dp, bottom = 2.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        // Left: Plus (+) Button
-                        IconButton(
-                            onClick = onAttach,
-                            modifier = Modifier.size(36.dp)
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
-                                imageVector = Icons.Default.Add,
-                                contentDescription = "Add attachment",
-                                tint = Color.White,
-                                modifier = Modifier
-                                    .size(24.dp)
-                                    .graphicsLayer { rotationZ = plusRotation }
+                                painter = painterResource(id = R.drawable.ic_chatgpt_globe),
+                                contentDescription = "Search the web",
+                                modifier = Modifier.size(13.dp),
+                                tint = Color(0xFF10A37F)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = if (isMultiLine) "Web Search" else "Web",
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color(0xFF10A37F)
                             )
                         }
-
-                        // Right Controls: [ ⤢ ] [ 🎤 ] [ (↑) ]
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    }
+                }
+            } else null,
+            textFieldContent = {
+                // Unconditionally mounted BasicTextField that NEVER unmounts, preserving focus & cursor 100%
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(
+                            min = if (isMultiLine) 42.dp else 24.dp,
+                            max = if (isMaximized) 360.dp else if (isMultiLine) 150.dp else 38.dp
+                        )
+                        .padding(horizontal = 4.dp, vertical = if (isMultiLine) 6.dp else 2.dp)
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
                         ) {
-                            // Expand/Minimize diagonal arrows icon
-                            IconButton(
-                                onClick = { isMaximized = !isMaximized },
-                                modifier = Modifier.size(36.dp)
+                            focusRequester.requestFocus()
+                            keyboardController?.show()
+                        },
+                    contentAlignment = Alignment.CenterStart
+                ) {
+                    BasicTextField(
+                        value = inputText,
+                        onValueChange = onTextChanged,
+                        enabled = true,
+                        minLines = if (isMultiLine) 2 else 1,
+                        maxLines = if (isMaximized) 16 else if (isMultiLine) 6 else 1,
+                        keyboardOptions = KeyboardOptions(
+                            capitalization = KeyboardCapitalization.Sentences,
+                            autoCorrect = true,
+                            keyboardType = KeyboardType.Text,
+                            imeAction = ImeAction.Default
+                        ),
+                        textStyle = TextStyle(
+                            fontSize = 16.sp,
+                            color = Color.White,
+                            lineHeight = 22.sp,
+                            fontFamily = FontFamily.Default
+                        ),
+                        cursorBrush = SolidColor(Color.White),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .focusRequester(focusRequester)
+                            .onFocusChanged {
+                                isFocused = it.isFocused
+                                if (it.isFocused) {
+                                    keyboardController?.show()
+                                }
+                            },
+                        decorationBox = { innerTextField ->
+                            Box(
+                                modifier = Modifier.fillMaxWidth(),
+                                contentAlignment = Alignment.CenterStart
                             ) {
-                                Icon(
-                                    imageVector = if (isMaximized) Icons.Default.CloseFullscreen else Icons.Default.OpenInFull,
-                                    contentDescription = "Expand input",
-                                    tint = Color(0xFFCCCCCC),
-                                    modifier = Modifier.size(19.dp)
-                                )
+                                if (inputText.isEmpty()) {
+                                    Text(
+                                        text = when {
+                                            isWebSearchEnabled -> "Search"
+                                            hasAttachment -> "Ask about this..."
+                                            else -> "Message"
+                                        },
+                                        style = MaterialTheme.typography.bodyMedium.copy(
+                                            fontSize = 16.sp,
+                                            color = Color(0xFF8E8E93)
+                                        )
+                                    )
+                                }
+                                innerTextField()
                             }
+                        }
+                    )
+                }
+            },
+            plusButtonContent = {
+                // Bare ChatGPT + icon button (rotates 45° to an 'x' on open)
+                ChatGptSurfaceButton(
+                    onClick = onAttach,
+                    shape = CircleShape,
+                    color = Color.Transparent,
+                    modifier = Modifier.size(38.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Add,
+                        contentDescription = "Add attachment",
+                        modifier = Modifier
+                            .size(22.dp)
+                            .graphicsLayer { rotationZ = plusRotation },
+                        tint = Color(0xFFCDCDCD)
+                    )
+                }
+            },
+            singleLineActionsContent = {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    // Dictation mic button (bare icon, visible in VOICE state, smooth exit when typing/generating)
+                    AnimatedVisibility(
+                        visible = actionState == ActionButtonState.VOICE,
+                        enter = fadeIn(animationSpec = tween(160)) + scaleIn(
+                            initialScale = 0.6f,
+                            animationSpec = spring(
+                                dampingRatio = 0.72f,
+                                stiffness = Spring.StiffnessMedium
+                            )
+                        ) + expandHorizontally(
+                            animationSpec = spring(
+                                dampingRatio = 0.72f,
+                                stiffness = Spring.StiffnessMedium
+                            )
+                        ),
+                        exit = fadeOut(animationSpec = tween(120)) + scaleOut(
+                            targetScale = 0.6f,
+                            animationSpec = spring(
+                                dampingRatio = 0.85f,
+                                stiffness = Spring.StiffnessMedium
+                            )
+                        ) + shrinkHorizontally(
+                            animationSpec = spring(
+                                dampingRatio = 0.85f,
+                                stiffness = Spring.StiffnessMedium
+                            )
+                        )
+                    ) {
+                        ChatGptSurfaceButton(
+                            onClick = onVoiceInput,
+                            shape = CircleShape,
+                            color = Color.Transparent,
+                            modifier = Modifier.size(38.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Mic,
+                                contentDescription = "Voice dictation",
+                                tint = Color(0xFFCDCDCD),
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
+                    }
 
-                            // Mic Icon
-                            IconButton(
-                                onClick = onVoiceInput,
-                                modifier = Modifier.size(36.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Mic,
-                                    contentDescription = "Voice input",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(22.dp)
+                    // Dynamic Morphing Action Button (Voice Assistant <-> Send <-> Stop) with ChatGPT signature Coral Pink (#FA70AB)
+                    AnimatedContent(
+                        targetState = actionState,
+                        transitionSpec = {
+                            (scaleIn(
+                                initialScale = 0.5f,
+                                animationSpec = spring(
+                                    dampingRatio = 0.70f,
+                                    stiffness = Spring.StiffnessMedium
                                 )
-                            }
-
-                            // Coral Pink Circular Send Button (or Stop Button)
-                            if (isGenerating) {
+                            ) + fadeIn(
+                                animationSpec = tween(160)
+                            )).togetherWith(
+                                scaleOut(
+                                    targetScale = 0.5f,
+                                    animationSpec = spring(
+                                        dampingRatio = 0.85f,
+                                        stiffness = Spring.StiffnessMedium
+                                    )
+                                ) + fadeOut(
+                                    animationSpec = tween(120)
+                                )
+                            )
+                        },
+                        label = "singleLineActionButtonMorph"
+                    ) { state ->
+                        when (state) {
+                            ActionButtonState.STOP -> {
+                                // Coral Pink circle with pure white stop square
                                 ChatGptSurfaceButton(
                                     onClick = onStop,
                                     shape = CircleShape,
-                                    color = Color(0xFFF43F5E),
+                                    color = Color(0xFFFA70AB),
                                     modifier = Modifier.size(38.dp)
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Default.Stop,
-                                        contentDescription = "Stop",
+                                        painter = painterResource(id = R.drawable.ic_chatgpt_stop),
+                                        contentDescription = "Stop generating",
                                         tint = Color.White,
-                                        modifier = Modifier.size(16.dp)
+                                        modifier = Modifier.size(15.dp)
                                     )
                                 }
-                            } else {
-                                val canSend = isEnabled && inputText.isNotBlank()
+                            }
+                            ActionButtonState.SEND -> {
+                                val canSend = isEnabled && !isGenerating && (inputText.isNotBlank() || hasAttachment)
+                                // Coral Pink circle (#FA70AB) with pure white up-arrow
                                 ChatGptSurfaceButton(
                                     onClick = onSend,
                                     enabled = canSend,
                                     shape = CircleShape,
-                                    color = if (canSend) Color(0xFFF43F5E) else Color(0x38F43F5E),
+                                    color = if (canSend) Color(0xFFFA70AB) else Color(0xFF383838),
                                     modifier = Modifier.size(38.dp)
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Default.ArrowUpward,
+                                        painter = painterResource(id = R.drawable.ic_chatgpt_send),
                                         contentDescription = "Send",
+                                        tint = if (canSend) Color.White else Color(0xFF757575),
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
+                            ActionButtonState.VOICE -> {
+                                // ChatGPT signature Voice Mode assistant button (Coral Pink circle #FA70AB with white waveform)
+                                ChatGptSurfaceButton(
+                                    onClick = onVoiceAssistant,
+                                    shape = CircleShape,
+                                    color = Color(0xFFFA70AB),
+                                    modifier = Modifier.size(38.dp)
+                                ) {
+                                    Icon(
+                                        painter = painterResource(id = R.drawable.ic_chatgpt_voice),
+                                        contentDescription = "Voice assistant",
                                         tint = Color.White,
                                         modifier = Modifier.size(20.dp)
                                     )
@@ -5152,192 +5642,257 @@ fun ChatInputBar(
                         }
                     }
                 }
-            } else {
-                // =========================================================================
-                // SINGLE-LINE FLOATING ROUND BAR LAYOUT ("without text round and floating bar")
-                // =========================================================================
+            },
+            multiLineActionsContent = {
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    // Left Plus (+) Button
+                    // Expand/Collapse icon button
                     ChatGptSurfaceButton(
-                        onClick = onAttach,
+                        onClick = { isMaximized = !isMaximized },
                         shape = CircleShape,
-                        color = currentTheme.userBubble,
-                        border = BorderStroke(0.8.dp, currentTheme.border),
-                        modifier = Modifier
-                            .size(38.dp)
-                            .padding(2.dp)
+                        color = Color.Transparent,
+                        modifier = Modifier.size(36.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Add,
-                            contentDescription = "Add attachment",
-                            modifier = Modifier
-                                .size(20.dp)
-                                .graphicsLayer { rotationZ = plusRotation },
-                            tint = Color.White
+                            imageVector = if (isMaximized) Icons.Default.CloseFullscreen else Icons.Default.OpenInFull,
+                            contentDescription = if (isMaximized) "Collapse input" else "Expand input",
+                            tint = Color(0xFFB0B0B8),
+                            modifier = Modifier.size(18.dp)
                         )
                     }
 
-                    Spacer(modifier = Modifier.width(4.dp))
-
-                    // Center: Web Badge + Single-line Text Field
-                    Row(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        if (isWebSearchEnabled) {
-                            Surface(
-                                shape = RoundedCornerShape(12.dp),
-                                color = Color(0x3310A37F),
-                                border = BorderStroke(1.dp, Color(0x6610A37F)),
-                                modifier = Modifier
-                                    .height(28.dp)
-                                    .padding(end = 6.dp)
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .clickable { onToggleWebSearch() }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 7.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Language,
-                                        contentDescription = "Search the web",
-                                        modifier = Modifier.size(13.dp),
-                                        tint = Color(0xFF10A37F)
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text(
-                                        text = "Web",
-                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = Color(0xFF10A37F)
-                                    )
-                                }
-                            }
-                        }
-
-                        BasicTextField(
-                            value = inputText,
-                            onValueChange = onTextChanged,
-                            enabled = isEnabled && !isGenerating,
-                            onTextLayout = { lineCount = it.lineCount },
-                            textStyle = TextStyle(
-                                fontSize = 15.5.sp,
-                                color = Color.White,
-                                lineHeight = 21.sp,
-                                fontFamily = FontFamily.Default
-                            ),
-                            cursorBrush = SolidColor(Color.White),
-                            maxLines = 1,
-                            modifier = Modifier
-                                .weight(1f)
-                                .onFocusChanged { isFocused = it.isFocused }
-                                .padding(horizontal = 4.dp, vertical = 4.dp),
-                            decorationBox = { innerTextField ->
-                                Box(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    contentAlignment = Alignment.CenterStart
-                                ) {
-                                    if (inputText.isEmpty()) {
-                                        Text(
-                                            text = when {
-                                                isWebSearchEnabled -> "Search with Gemma..."
-                                                hasAttachment -> "Ask about this..."
-                                                else -> "Ask Gemma..."
-                                            },
-                                            style = MaterialTheme.typography.bodyMedium.copy(
-                                                fontSize = 15.5.sp,
-                                                color = Color(0xFF8E8E93)
-                                            )
-                                        )
-                                    }
-                                    innerTextField()
-                                }
-                            }
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.width(4.dp))
-
-                    // Right Actions
-                    if (isGenerating) {
+                    // Dictation Mic button (bare icon)
+                    if (!isGenerating) {
                         ChatGptSurfaceButton(
-                            onClick = onStop,
+                            onClick = onVoiceInput,
                             shape = CircleShape,
-                            color = Color(0xFFF43F5E),
-                            modifier = Modifier
-                                .size(38.dp)
-                                .padding(2.dp)
+                            color = Color.Transparent,
+                            modifier = Modifier.size(36.dp)
                         ) {
                             Icon(
-                                imageVector = Icons.Default.Stop,
-                                contentDescription = "Stop generating",
-                                tint = Color.White,
-                                modifier = Modifier.size(16.dp)
-                            )
-                        }
-                    } else if (inputText.isNotBlank() || hasAttachment) {
-                        val canSend = isEnabled && !isGenerating
-                        ChatGptSurfaceButton(
-                            onClick = onSend,
-                            enabled = canSend,
-                            shape = CircleShape,
-                            color = if (canSend) Color(0xFFF43F5E) else Color(0x38F43F5E),
-                            modifier = Modifier
-                                .size(38.dp)
-                                .padding(2.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.ArrowUpward,
-                                contentDescription = "Send",
-                                tint = Color.White,
+                                imageVector = Icons.Default.Mic,
+                                contentDescription = "Voice input",
+                                tint = Color(0xFFCDCDCD),
                                 modifier = Modifier.size(20.dp)
                             )
                         }
-                    } else {
-                        // Empty idle: White Mic icon + Coral Pink circular Voice Assistant button
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
-                        ) {
+                    }
+
+                    AnimatedContent(
+                        targetState = if (isGenerating) ActionButtonState.STOP else ActionButtonState.SEND,
+                        transitionSpec = {
+                            (scaleIn(
+                                initialScale = 0.5f,
+                                animationSpec = spring(
+                                    dampingRatio = 0.70f,
+                                    stiffness = Spring.StiffnessMedium
+                                )
+                            ) + fadeIn(
+                                animationSpec = tween(160)
+                            )).togetherWith(
+                                scaleOut(
+                                    targetScale = 0.5f,
+                                    animationSpec = spring(
+                                        dampingRatio = 0.85f,
+                                        stiffness = Spring.StiffnessMedium
+                                    )
+                                ) + fadeOut(
+                                    animationSpec = tween(120)
+                                )
+                            )
+                        },
+                        label = "multiLineActionButtonMorph"
+                    ) { state ->
+                        if (state == ActionButtonState.STOP) {
                             ChatGptSurfaceButton(
-                                onClick = onVoiceInput,
+                                onClick = onStop,
                                 shape = CircleShape,
-                                color = currentTheme.userBubble,
-                                border = BorderStroke(0.8.dp, currentTheme.border),
-                                modifier = Modifier.size(36.dp)
+                                color = Color(0xFFFA70AB),
+                                modifier = Modifier.size(38.dp)
                             ) {
                                 Icon(
-                                    imageVector = Icons.Default.Mic,
-                                    contentDescription = "Voice input",
+                                    painter = painterResource(id = R.drawable.ic_chatgpt_stop),
+                                    contentDescription = "Stop",
                                     tint = Color.White,
-                                    modifier = Modifier.size(20.dp)
+                                    modifier = Modifier.size(15.dp)
                                 )
                             }
-
+                        } else {
+                            val canSend = isEnabled && (inputText.isNotBlank() || hasAttachment)
                             ChatGptSurfaceButton(
-                                onClick = onVoiceAssistant,
+                                onClick = onSend,
+                                enabled = canSend,
                                 shape = CircleShape,
-                                color = Color(0xFFF43F5E),
-                                modifier = Modifier
-                                    .size(38.dp)
-                                    .padding(2.dp)
+                                color = if (canSend) Color(0xFFFA70AB) else Color(0xFF383838),
+                                modifier = Modifier.size(38.dp)
                             ) {
                                 Icon(
-                                    imageVector = Icons.Default.GraphicEq,
-                                    contentDescription = "Voice assistant",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(20.dp)
+                                    painter = painterResource(id = R.drawable.ic_chatgpt_send),
+                                    contentDescription = "Send",
+                                    tint = if (canSend) Color.White else Color(0xFF757575),
+                                    modifier = Modifier.size(18.dp)
                                 )
                             }
                         }
                     }
                 }
+            }
+        )
+    }
+}
+}
+
+
+@Composable
+private fun ChatInputBarLayout(
+    isMultiLine: Boolean,
+    modifier: Modifier = Modifier,
+    attachmentContent: (@Composable () -> Unit)? = null,
+    webBadgeContent: (@Composable () -> Unit)? = null,
+    textFieldContent: @Composable () -> Unit,
+    plusButtonContent: @Composable () -> Unit,
+    singleLineActionsContent: @Composable () -> Unit,
+    multiLineActionsContent: @Composable () -> Unit
+) {
+    Layout(
+        content = {
+            if (attachmentContent != null) {
+                Box(Modifier.layoutId("attachment")) {
+                    attachmentContent()
+                }
+            }
+            if (webBadgeContent != null) {
+                Box(Modifier.layoutId("webBadge")) {
+                    webBadgeContent()
+                }
+            }
+            Box(Modifier.layoutId("textField")) {
+                textFieldContent()
+            }
+            Box(Modifier.layoutId("plus")) {
+                plusButtonContent()
+            }
+            if (isMultiLine) {
+                Box(Modifier.layoutId("multiActions")) {
+                    multiLineActionsContent()
+                }
+            } else {
+                Box(Modifier.layoutId("singleActions")) {
+                    singleLineActionsContent()
+                }
+            }
+        },
+        modifier = modifier
+    ) { measurables, constraints ->
+        val attachmentMeasurable = measurables.firstOrNull { it.layoutId == "attachment" }
+        val webBadgeMeasurable = measurables.firstOrNull { it.layoutId == "webBadge" }
+        val textFieldMeasurable = measurables.first { it.layoutId == "textField" }
+        val plusMeasurable = measurables.first { it.layoutId == "plus" }
+
+        val horizontalPadding = 4.dp.roundToPx()
+        val verticalPadding = 2.dp.roundToPx()
+        val innerSpacing = 4.dp.roundToPx()
+        val availableWidth = (constraints.maxWidth - horizontalPadding * 2).coerceAtLeast(0)
+
+        if (isMultiLine) {
+            val multiActionsMeasurable = measurables.first { it.layoutId == "multiActions" }
+
+            val attachmentPlaceable = attachmentMeasurable?.measure(
+                constraints.copy(minWidth = 0, maxWidth = availableWidth, minHeight = 0)
+            )
+            val webBadgePlaceable = webBadgeMeasurable?.measure(
+                constraints.copy(minWidth = 0, maxWidth = availableWidth, minHeight = 0)
+            )
+            val plusPlaceable = plusMeasurable.measure(
+                constraints.copy(minWidth = 0, minHeight = 0)
+            )
+            val actionsPlaceable = multiActionsMeasurable.measure(
+                constraints.copy(minWidth = 0, maxWidth = availableWidth, minHeight = 0)
+            )
+            val textFieldPlaceable = textFieldMeasurable.measure(
+                constraints.copy(minWidth = availableWidth, maxWidth = availableWidth, minHeight = 0)
+            )
+
+            val toolbarHeight = maxOf(plusPlaceable.height, actionsPlaceable.height)
+            val totalHeight = verticalPadding * 2 +
+                    (attachmentPlaceable?.height?.plus(innerSpacing) ?: 0) +
+                    (webBadgePlaceable?.height?.plus(innerSpacing) ?: 0) +
+                    textFieldPlaceable.height +
+                    innerSpacing +
+                    toolbarHeight
+
+            layout(constraints.maxWidth, totalHeight) {
+                var currentY = verticalPadding
+
+                attachmentPlaceable?.let {
+                    it.placeRelative(horizontalPadding, currentY)
+                    currentY += it.height + innerSpacing
+                }
+
+                webBadgePlaceable?.let {
+                    it.placeRelative(horizontalPadding, currentY)
+                    currentY += it.height + innerSpacing
+                }
+
+                textFieldPlaceable.placeRelative(horizontalPadding, currentY)
+                currentY += textFieldPlaceable.height + innerSpacing
+
+                val plusY = currentY + (toolbarHeight - plusPlaceable.height) / 2
+                plusPlaceable.placeRelative(horizontalPadding, plusY)
+
+                val actionsX = constraints.maxWidth - horizontalPadding - actionsPlaceable.width
+                val actionsY = currentY + (toolbarHeight - actionsPlaceable.height) / 2
+                actionsPlaceable.placeRelative(actionsX, actionsY)
+            }
+        } else {
+            val singleActionsMeasurable = measurables.first { it.layoutId == "singleActions" }
+
+            val plusPlaceable = plusMeasurable.measure(
+                constraints.copy(minWidth = 0, minHeight = 0)
+            )
+            val actionsPlaceable = singleActionsMeasurable.measure(
+                constraints.copy(minWidth = 0, minHeight = 0)
+            )
+            val webBadgePlaceable = webBadgeMeasurable?.measure(
+                constraints.copy(minWidth = 0, minHeight = 0)
+            )
+
+            val badgeWidthWithSpacing = if (webBadgePlaceable != null) webBadgePlaceable.width + innerSpacing else 0
+            val remainingWidthForText = (availableWidth - plusPlaceable.width - actionsPlaceable.width - innerSpacing * 2 - badgeWidthWithSpacing).coerceAtLeast(0)
+
+            val textFieldPlaceable = textFieldMeasurable.measure(
+                constraints.copy(minWidth = remainingWidthForText, maxWidth = remainingWidthForText, minHeight = 0)
+            )
+
+            val contentHeight = maxOf(
+                plusPlaceable.height,
+                actionsPlaceable.height,
+                textFieldPlaceable.height,
+                webBadgePlaceable?.height ?: 0
+            )
+            val totalHeight = contentHeight + verticalPadding * 2
+
+            layout(constraints.maxWidth, totalHeight) {
+                var currentX = horizontalPadding
+
+                val plusY = (totalHeight - plusPlaceable.height) / 2
+                plusPlaceable.placeRelative(currentX, plusY)
+                currentX += plusPlaceable.width + innerSpacing
+
+                webBadgePlaceable?.let {
+                    val badgeY = (totalHeight - it.height) / 2
+                    it.placeRelative(currentX, badgeY)
+                    currentX += it.width + innerSpacing
+                }
+
+                val textY = (totalHeight - textFieldPlaceable.height) / 2
+                textFieldPlaceable.placeRelative(currentX, textY)
+
+                val actionsX = constraints.maxWidth - horizontalPadding - actionsPlaceable.width
+                val actionsY = (totalHeight - actionsPlaceable.height) / 2
+                actionsPlaceable.placeRelative(actionsX, actionsY)
             }
         }
     }
@@ -5465,6 +6020,29 @@ fun AttachmentDialog(
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Cancel", color = Color.White) }
         }
+    )
+}
+
+/**
+ * Combines a small selection of text/PDF files into one token-bounded chat
+ * attachment. Vision models accept one image at a time, so a mixed selection
+ * retains the first image and combines document text when there is no image.
+ */
+private fun combineDocumentsForChat(documents: List<ExtractedDocument>): ExtractedDocument {
+    require(documents.isNotEmpty())
+    if (documents.size == 1) return documents.single()
+
+    documents.firstOrNull { it.isImage }?.let { return it }
+
+    val combinedText = documents.joinToString(separator = "\n\n") { document ->
+        "--- ${document.fileName} ---\n${document.text}"
+    }
+    val names = documents.joinToString(", ") { it.fileName }.take(120)
+    return ExtractedDocument(
+        fileName = "$names (${documents.size} files)",
+        text = combinedText,
+        wordCount = documents.sumOf { it.wordCount },
+        pageCount = documents.sumOf { it.pageCount }
     )
 }
 
@@ -5827,3 +6405,198 @@ fun extractFollowUpSuggestions(text: String): List<String> {
 
     return suggestions.distinct().take(4)
 }
+
+@Composable
+private fun ModelInfoSheetContent(
+    engineState: com.teja.gemmmobile.ai.EngineState,
+    isWebSearchEnabled: Boolean,
+    onToggleWebSearch: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 24.dp, vertical = 8.dp)
+            .padding(bottom = 28.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Box(
+            modifier = Modifier
+                .size(52.dp)
+                .clip(CircleShape)
+                .background(Color(0xFF2A2A2E)),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = Icons.Default.AutoAwesome,
+                contentDescription = null,
+                tint = Color.White,
+                modifier = Modifier.size(26.dp)
+            )
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Text(
+            text = "ChatGPT Local AI",
+            style = MaterialTheme.typography.titleMedium.copy(
+                fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
+                color = Color.White,
+                fontSize = 18.sp
+            )
+        )
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        Text(
+            text = "Running on-device with zero server tracking",
+            style = MaterialTheme.typography.bodySmall.copy(
+                color = Color(0xFF8E8E93),
+                fontSize = 13.sp
+            )
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // Status Card
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = Color(0xFF242428),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                // Engine Status
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(
+                                    when (engineState) {
+                                        is com.teja.gemmmobile.ai.EngineState.Ready -> Color(0xFF10A37F)
+                                        is com.teja.gemmmobile.ai.EngineState.Generating -> Color(0xFFE5A83B)
+                                        is com.teja.gemmmobile.ai.EngineState.Loading -> Color(0xFF388BFD)
+                                        else -> Color(0xFF8E8E93)
+                                    }
+                                )
+                        )
+                        Text(
+                            text = "Model Engine",
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                                color = Color(0xFFE0E0E6),
+                                fontWeight = androidx.compose.ui.text.font.FontWeight.Medium
+                            )
+                        )
+                    }
+
+                    Text(
+                        text = when (engineState) {
+                            is com.teja.gemmmobile.ai.EngineState.Ready -> "Ready (${engineState.backend.name})"
+                            is com.teja.gemmmobile.ai.EngineState.Generating -> "Active (${engineState.backend.name})"
+                            is com.teja.gemmmobile.ai.EngineState.Loading -> "Loading..."
+                            else -> "Idle"
+                        },
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            color = Color(0xFF9E9EAA),
+                            fontWeight = androidx.compose.ui.text.font.FontWeight.Normal
+                        )
+                    )
+                }
+
+                HorizontalDivider(color = Color(0xFF323238), thickness = 0.5.dp)
+
+                // Web Search Toggle
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Search the Web",
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                                color = Color.White,
+                                fontWeight = androidx.compose.ui.text.font.FontWeight.Medium
+                            )
+                        )
+                        Text(
+                            text = "Fetch live citations & real-time answers",
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                color = Color(0xFF8E8E93),
+                                fontSize = 12.sp
+                            )
+                        )
+                    }
+                    Switch(
+                        checked = isWebSearchEnabled,
+                        onCheckedChange = { onToggleWebSearch() },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.White,
+                            checkedTrackColor = Color(0xFF10A37F),
+                            uncheckedThumbColor = Color(0xFFAAAAAA),
+                            uncheckedTrackColor = Color(0xFF3A3A3E)
+                        )
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Settings Button
+        Surface(
+            shape = RoundedCornerShape(14.dp),
+            color = Color(0xFF242428),
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onOpenSettings() }
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Settings,
+                        contentDescription = null,
+                        tint = Color(0xFFCCCCCC),
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Text(
+                        text = "Model & App Settings",
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            color = Color.White,
+                            fontWeight = androidx.compose.ui.text.font.FontWeight.Medium
+                        )
+                    )
+                }
+                Text(
+                    text = "›",
+                    color = Color(0xFF6E6E73),
+                    fontSize = 20.sp,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Light
+                )
+            }
+        }
+    }
+}
+
