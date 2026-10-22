@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -1731,16 +1732,18 @@ fun highlightCodeSyntax(code: String, language: String): AnnotatedString {
  * Calculates physical layout width for ChatGPT stadium citation capsule.
  */
 fun calculateCitationPillWidth(brand: String, extraCount: Int): androidx.compose.ui.unit.TextUnit {
-    val charWidth = 6.6
-    val base = 12.0 + 4.5 + 18.0 + (brand.length * charWidth)
-    val extra = if (extraCount > 0) 18.0 else 0.0
+    val displayBrand = brand.take(13).trim()
+    val charWidth = 6.4
+    // 4dp outer padding + 12dp inner padding + 12dp favicon + 4.5dp gap
+    val base = 4.0 + 12.0 + 12.0 + 4.5 + (displayBrand.length * charWidth)
+    val extra = if (extraCount > 0) 16.0 else 0.0
     return (base + extra).sp
 }
 
 /**
  * ChatGPT-style inline citation capsule pill.
  * Renders a sleek stadium pill: [ (Favicon) Brand +Count ]
- * Zero square backgrounds, zero arrows.
+ * Name and icon are perfectly horizontally and vertically centered with zero overflow.
  */
 @Composable
 fun CitationCapsule(
@@ -1749,38 +1752,55 @@ fun CitationCapsule(
     extraCount: Int = 0,
     onClick: () -> Unit = {}
 ) {
+    val displayBrand = remember(brand) { brand.take(13).trim() }
+
     Surface(
         shape = RoundedCornerShape(percent = 50),
         color = Color(0xFF2C2C2E),
         border = BorderStroke(0.6.dp, Color(0xFF3E3E42)),
         modifier = Modifier
+            .fillMaxSize()
             .clip(RoundedCornerShape(percent = 50))
             .clickable(onClick = onClick)
             .padding(horizontal = 2.dp)
     ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.5.dp)
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center
         ) {
-            DomainFaviconBadge(
-                url = url,
-                size = 12.dp
-            )
-            Text(
-                text = brand,
-                color = Color(0xFFD1D1D6),
-                fontSize = 11.5.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1
-            )
-            if (extraCount > 0) {
-                Text(
-                    text = "+$extraCount",
-                    color = Color(0xFF8E8E93),
-                    fontSize = 10.5.sp,
-                    fontWeight = FontWeight.Medium
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
+            ) {
+                DomainFaviconBadge(
+                    url = url,
+                    size = 12.dp
                 )
+                Spacer(modifier = Modifier.width(4.5.dp))
+                Text(
+                    text = displayBrand,
+                    color = Color(0xFFD1D1D6),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    style = TextStyle(
+                        platformStyle = androidx.compose.ui.text.PlatformTextStyle(includeFontPadding = false),
+                        textAlign = TextAlign.Center
+                    )
+                )
+                if (extraCount > 0) {
+                    Spacer(modifier = Modifier.width(3.dp))
+                    Text(
+                        text = "+$extraCount",
+                        color = Color(0xFF8E8E93),
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Medium,
+                        style = TextStyle(
+                            platformStyle = androidx.compose.ui.text.PlatformTextStyle(includeFontPadding = false),
+                            textAlign = TextAlign.Center
+                        )
+                    )
+                }
             }
         }
     }
@@ -1907,11 +1927,30 @@ fun getSourceBrand(url: String, title: String): Pair<String, String> {
         isYoutube -> "YouTube"
         isFacebook -> "Facebook"
         isInstagram -> "Instagram"
-        isSrm -> "SRM University"
+        isSrm -> "SRM"
         isAmazon -> "Amazon"
         isFlipkart -> "Flipkart"
         isReddit -> "Reddit"
-        host.isNotBlank() -> host.substringBefore(".").replaceFirstChar { it.uppercase() }
+        host.contains("semiengineering") -> "SemiEng"
+        host.contains("techcrunch") -> "TechCrunch"
+        host.contains("theverge") -> "The Verge"
+        host.contains("gsmarena") -> "GSMArena"
+        host.contains("thehindu") -> "The Hindu"
+        host.contains("eenadu") -> "Eenadu"
+        host.contains("sakshi") -> "Sakshi"
+        host.contains("ndtv") -> "NDTV"
+        host.contains("bbc") -> "BBC"
+        host.contains("reuters") -> "Reuters"
+        host.contains("bloomberg") -> "Bloomberg"
+        host.contains("cnet") -> "CNET"
+        host.contains("quora") -> "Quora"
+        host.contains("medium") -> "Medium"
+        host.contains("stackoverflow") -> "StackOverflow"
+        host.isNotBlank() -> {
+            val root = host.substringBefore(".")
+            if (root.length > 12) root.take(11).replaceFirstChar { it.uppercase() }
+            else root.replaceFirstChar { it.uppercase() }
+        }
         else -> "Source"
     }
     return brand to url
@@ -2058,7 +2097,7 @@ fun sanitizeMarkdown(input: String, searchResults: List<SearchResult> = emptyLis
             s = s.replace(bareBrand, "[citation:$brand:0](${res.url})")
         }
 
-        // 5. Ground markdown links [Title](url) to real URLs from searchResults to prevent random/hallucinated domains
+        // 5. Ground markdown links [Title](url) to real URLs from searchResults ONLY when strictly matched
         val markdownLinkRegex = Regex("""\[([^\]]+)\]\((https?://[^\s)]+)\)""")
         s = s.replace(markdownLinkRegex) { match ->
             val linkText = match.groupValues[1].trim()
@@ -2072,32 +2111,18 @@ fun sanitizeMarkdown(input: String, searchResults: List<SearchResult> = emptyLis
                 val resHost = try { java.net.URI(res.url).host?.removePrefix("www.")?.lowercase() } catch (_: Exception) { null }
                 val genHost = try { java.net.URI(generatedUrl).host?.removePrefix("www.")?.lowercase() } catch (_: Exception) { null }
 
-                (genHost != null && resHost != null && (genHost.contains(resHost) || resHost.contains(genHost))) ||
+                (genHost != null && resHost != null && (genHost == resHost || genHost.endsWith(".$resHost") || resHost.endsWith(".$genHost"))) ||
                 (linkText.contains("linkedin", ignoreCase = true) && res.url.contains("linkedin", ignoreCase = true)) ||
                 (linkText.contains("github", ignoreCase = true) && res.url.contains("github", ignoreCase = true)) ||
                 (linkText.contains("hugging", ignoreCase = true) && res.url.contains("huggingface", ignoreCase = true)) ||
                 (linkText.contains("wikipedia", ignoreCase = true) && res.url.contains("wikipedia", ignoreCase = true))
             }
 
-            val targetRes = matchedResult ?: searchResults.firstOrNull()
-            val targetUrl = targetRes?.url ?: generatedUrl
-            val (brand, _) = if (targetRes != null) getSourceBrand(targetRes.url, targetRes.title) else getSourceBrand(targetUrl, linkText)
-
-            val isDomainOrCitation = linkText.matches(Regex("""^\[?\d+\]?$""")) ||
-                    linkText.contains(".") ||
-                    linkText.contains("/") ||
-                    linkText.equals("source", ignoreCase = true) ||
-                    linkText.equals("link", ignoreCase = true) ||
-                    linkText.equals("reference", ignoreCase = true) ||
-                    linkText.equals("profile", ignoreCase = true) ||
-                    linkText.equals(brand, ignoreCase = true) ||
-                    linkText.contains(brand, ignoreCase = true) ||
-                    (targetRes != null && linkText.length <= 25)
-
-            if (isDomainOrCitation && searchResults.isNotEmpty()) {
-                "[citation:$brand:0]($targetUrl)"
+            if (matchedResult != null) {
+                val (brand, _) = getSourceBrand(matchedResult.url, matchedResult.title)
+                "[citation:$brand:0](${matchedResult.url})"
             } else {
-                "[$linkText]($targetUrl)"
+                "[$linkText]($generatedUrl)"
             }
         }
 
@@ -2108,46 +2133,9 @@ fun sanitizeMarkdown(input: String, searchResults: List<SearchResult> = emptyLis
             val matched = searchResults.firstOrNull { res ->
                 val resHost = try { java.net.URI(res.url).host?.removePrefix("www.")?.lowercase() } catch (_: Exception) { null }
                 val rawHost = try { java.net.URI(rawUrl).host?.removePrefix("www.")?.lowercase() } catch (_: Exception) { null }
-                resHost != null && rawHost != null && (resHost.contains(rawHost) || rawHost.contains(resHost))
+                resHost != null && rawHost != null && (resHost == rawHost || resHost.endsWith(".$rawHost") || rawHost.endsWith(".$resHost"))
             }
-            matched?.url ?: (if (searchResults.isNotEmpty()) searchResults.first().url else rawUrl)
-        }
-
-        // 7. Fallback Auto-Grounding: If model generated factual text without citations, auto-ground each paragraph/sentence with verified website citation pills
-        val hasAnyCitations = s.contains(Regex("""\[[^\]]+\]\(https?://"""))
-        if (!hasAnyCitations && searchResults.isNotEmpty() && !s.contains(":::product", ignoreCase = true)) {
-            val lines = s.lines()
-            val newLines = mutableListOf<String>()
-            var citationIdx = 0
-
-            for (line in lines) {
-                val trimmed = line.trim()
-                if (trimmed.isEmpty() || trimmed.startsWith("#") || trimmed.startsWith("```") || trimmed.startsWith("|")) {
-                    newLines.add(line)
-                    continue
-                }
-
-                // Check keyword matching with search results
-                val matchedRes = searchResults.withIndex().firstOrNull { (_, res) ->
-                    val host = try { java.net.URI(res.url).host?.removePrefix("www.")?.substringBefore(".") ?: "" } catch (_: Exception) { "" }
-                    (host.length >= 3 && trimmed.contains(host, ignoreCase = true)) ||
-                    (res.title.length >= 5 && trimmed.contains(res.title.substringBefore(" ").take(10), ignoreCase = true))
-                }
-
-                val targetIdx = matchedRes?.index ?: (citationIdx % searchResults.size)
-                citationIdx++
-                val res = searchResults[targetIdx]
-                val (brand, _) = getSourceBrand(res.url, res.title)
-                val citationPill = " [citation:$brand:0](${res.url})"
-
-                val updatedLine = if (trimmed.endsWith(".")) {
-                    trimmed.dropLast(1).trimEnd() + citationPill + "."
-                } else {
-                    trimmed + citationPill
-                }
-                newLines.add(updatedLine)
-            }
-            s = newLines.joinToString("\n")
+            matched?.url ?: rawUrl
         }
     }
 

@@ -1217,8 +1217,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     searchContext.isNotBlank() -> {
                         "$baseSystemPrompt\n\n" +
-                        "Live web search results are provided above. Answer the user's question clearly, accurately, and naturally based on the search results. " +
-                        "If sources or links are present, cite them naturally. " +
+                        "Verified live web search results are provided above, numbered [1], [2], [3], etc.\n" +
+                        "Answer the user's question clearly, accurately, and naturally based ONLY on the provided search results.\n" +
+                        "When citing sources, use standard bracket numbers matching the search results (e.g. [1] or [2]).\n" +
+                        "CRITICAL: NEVER fabricate, invent, or hallucinate URLs or links. Only state verified facts from the search results.\n" +
                         "Respond in the same language as the user's message (English or Telugu)."
                     }
                     matchedSkill != null -> {
@@ -1459,8 +1461,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
 
                     val nextTurnSystemPrompt = "$baseSystemPrompt\n\n" +
-                        "Live web results are provided below as factual evidence. Answer the user's question clearly, accurately, and directly based on this information. " +
-                        "Cite sources naturally. Do not call any further tools."
+                        "Live web results are provided below as factual evidence, numbered [1], [2], etc. Answer the user's question clearly, accurately, and directly based on this information. " +
+                        "When citing facts, reference the source numbers in brackets (e.g. [1] or [2]). NEVER fabricate URLs or links. Do not call any further tools."
 
                     val nextTurnPrompt = contextManager.buildPrompt(
                         systemPrompt = nextTurnSystemPrompt,

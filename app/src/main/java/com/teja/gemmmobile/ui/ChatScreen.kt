@@ -3384,7 +3384,11 @@ fun DomainFaviconBadge(
                 text = label,
                 fontSize = (size.value * 0.52f).sp,
                 fontWeight = FontWeight.Bold,
-                color = Color.White
+                color = Color.White,
+                style = TextStyle(
+                    platformStyle = androidx.compose.ui.text.PlatformTextStyle(includeFontPadding = false),
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                )
             )
         }
     }
