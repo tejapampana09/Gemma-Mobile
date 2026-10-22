@@ -4,6 +4,7 @@ import android.content.Context
 import com.teja.gemmmobile.tools.DeviceIntentsTool
 import com.teja.gemmmobile.tools.QrCodeTool
 import com.teja.gemmmobile.tools.WikipediaTool
+import com.teja.gemmmobile.tools.WebSearchTool
 
 /**
  * Registry of all official and custom on-device AI Skills for Gemma Mobile.
@@ -14,10 +15,12 @@ class SkillRegistry(private val context: Context) {
     val deviceIntentsTool = DeviceIntentsTool(context)
     val qrCodeTool = QrCodeTool(context)
     val wikipediaTool = WikipediaTool()
+    val webSearchTool = WebSearchTool()
 
     val skills: List<GemmaSkill> by lazy {
         listOf(
             createPdfMakerSkill(),
+            createWebResearcherSkill(),
             createDeviceIntentsSkill(),
             createQrCodeSkill(),
             createWikipediaSkill(),
@@ -208,6 +211,46 @@ class SkillRegistry(private val context: Context) {
                 5. Include comprehensive explanations, formal definitions, detailed bullet points, equations/formulas, and comparison tables where appropriate.
                 6. Absolutely NO conversational filler (no 'Sure!', 'Certainly!', 'Here is...'). Output the pure, well-structured document directly so the system can compile it into a PDF file.
             """.trimIndent()
+        )
+    }
+
+    private fun createWebResearcherSkill(): GemmaSkill {
+        return GemmaSkill(
+            id = "web-researcher",
+            name = "Live Web Research & AI Fact Finder",
+            icon = "🌐",
+            description = "Formulates optimal search queries from natural language or Telugu/Tanglish questions, searches the live internet, and synthesizes accurate, up-to-date answers.",
+            keywords = listOf(
+                "search", "web search", "browse", "google", "look up", "latest",
+                "today", "eeroju", "net lo", "internet", "news", "current",
+                "price", "dhara", "rate", "weather", "updates", "samacharam",
+                "search chey", "browse chey", "net lo chudu", "google chey",
+                "online lo", "live info", "fact check", "fact finder", "research"
+            ),
+            systemDirective = """
+                ## SKILL: LIVE WEB RESEARCH & FACT FINDER (web-researcher)
+                You are an elite live web researcher and real-time fact-finding specialist.
+                1. **Search Keyword Optimization**:
+                   - Whenever the user asks for real-time information, news, current prices, or recent events:
+                   - Convert conversational questions and Telugu/regional queries into 2 to 5 high-yield, concise English search keywords.
+                   - Example: "Hyd lo eeroju gold price entha undhi" -> "hyderabad gold price today 22k 24k"
+                   - Example: "latest telangana news updates" -> "telangana latest news updates today"
+                2. **Tool Invocation**:
+                   - Call the `web_search` tool using JSON:
+                   ```json
+                   {
+                     "name": "web_search",
+                     "arguments": {
+                       "query": "<optimized search keywords>"
+                     }
+                   }
+                   ```
+                3. **Answer Synthesis**:
+                   - When search results are returned, synthesize a direct, comprehensive, and factual answer.
+                   - Answer in the user's preferred language (Telugu or English).
+                   - Cite verified sources and websites naturally.
+            """.trimIndent(),
+            tools = listOf(webSearchTool)
         )
     }
 }

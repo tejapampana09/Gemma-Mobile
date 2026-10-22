@@ -493,6 +493,114 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         return q.ifBlank { raw.trim() }
     }
 
+    /**
+     * Smart fallback normalizer for offline/fast queries:
+     * Translates common Telugu/Tanglish conversational intent words to English keywords
+     * and strips conversational filler words like 'cheppu', 'undhi', 'bro', 'please'.
+     */
+    private fun fallbackNormalizeQuery(raw: String): String {
+        var q = resolveSearchQuery(raw, emptyList())
+
+        val replacements = listOf(
+            Regex("""\beeroju\b""", RegexOption.IGNORE_CASE) to "today",
+            Regex("""\bippudu\b""", RegexOption.IGNORE_CASE) to "current",
+            Regex("""\bvarthalu\b""", RegexOption.IGNORE_CASE) to "news",
+            Regex("""\bsamacharam\b""", RegexOption.IGNORE_CASE) to "news update",
+            Regex("""\bdharalu\b""", RegexOption.IGNORE_CASE) to "prices",
+            Regex("""\bdhara\b""", RegexOption.IGNORE_CASE) to "price",
+            Regex("""\bentha\b""", RegexOption.IGNORE_CASE) to "price",
+            Regex("""\bhyd\b""", RegexOption.IGNORE_CASE) to "hyderabad",
+            Regex("""\bvizag\b""", RegexOption.IGNORE_CASE) to "visakhapatnam",
+            Regex("""\bvja\b""", RegexOption.IGNORE_CASE) to "vijayawada",
+            Regex("""\bgurinchi\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bcheppu\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bcheppandi\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bchey\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bcheyyi\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bchudu\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bchupinchu\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bundhi\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bunna\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bunnayi\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bkavali\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bivvu\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bivvandi\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bbro\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bplease\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\btell me\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bcan you\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bwhat is\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bwhat are\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\btelugu lo\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bnet lo\b""", RegexOption.IGNORE_CASE) to "",
+            Regex("""\bonline lo\b""", RegexOption.IGNORE_CASE) to ""
+        )
+
+        for ((regex, replacement) in replacements) {
+            q = regex.replace(q, replacement)
+        }
+
+        // Clean extra punctuation and normalize whitespace
+        q = q.replace(Regex("""[?.,!\"':;()]+"""), " ").trim()
+        q = q.replace(Regex("""\s+"""), " ").trim()
+
+        return q.ifBlank { raw.trim() }
+    }
+
+    /**
+     * Uses Gemma SLM on-device to formulate 2 to 5 high-yield search engine keywords
+     * from conversational or multilingual/Telugu user requests before hitting DuckDuckGo/Web.
+     * Features a strict 2.5s timeout with automatic fast fallback.
+     */
+    private suspend fun formulateAiSearchQuery(prompt: String, eng: GemmaEngine): String {
+        val words = prompt.trim().split(Regex("""\s+"""))
+        val isTelugu = prompt.any { it.code in 0x0C00..0x0C7F }
+        val isConversational = words.size > 4 || isTelugu || prompt.contains("?") ||
+                listOf("tell", "what", "how", "cheppu", "bro", "eeroju", "undhi", "lo", "who", "which").any { prompt.lowercase().contains(it) }
+
+        if (!isConversational && words.size in 1..4) {
+            return prompt.trim()
+        }
+
+        return try {
+            kotlinx.coroutines.withTimeoutOrNull(2500L) {
+                val cleanUserPrompt = prompt.take(160).replace("\"", "")
+                val systemPrompt = "You are an AI Search Query Formulator. Given a user question, output ONLY 2 to 5 concise English search keywords optimized for search engines. Translate regional languages to English. Output NO quotes, NO explanation, NO conversational filler. Only keywords."
+                val userPrompt = "User request: \"$cleanUserPrompt\"\nKeywords:"
+
+                val chunks = StringBuilder()
+                eng.sendMessage(
+                    prompt = userPrompt,
+                    systemInstruction = systemPrompt,
+                    enableThinkingOverride = false,
+                    dynamicMaxOutputOverride = 16
+                ).collect { chunk ->
+                    if (chunk.text.isNotBlank()) {
+                        chunks.append(chunk.text)
+                    }
+                }
+
+                val result = chunks.toString().trim()
+                    .lines().firstOrNull { it.isNotBlank() } ?: ""
+                var clean = result
+                    .replace(Regex("""^["'`*-]+"""), "")
+                    .replace(Regex("""["'`]+$"""), "")
+                    .replace(Regex("""^(keywords|query|search query|search for):\s*""", RegexOption.IGNORE_CASE), "")
+                    .trim()
+
+                if (clean.isNotBlank() && clean.length > 2 && !clean.contains("cannot", ignoreCase = true) && !clean.contains("as an ai", ignoreCase = true)) {
+                    Log.i(TAG, "[$TAG] AI formulated search query: '$clean' from prompt: '$prompt'")
+                    clean
+                } else {
+                    fallbackNormalizeQuery(prompt)
+                }
+            } ?: fallbackNormalizeQuery(prompt)
+        } catch (t: Throwable) {
+            Log.w(TAG, "[$TAG] AI query formulation failed or timed out, using fallback", t)
+            fallbackNormalizeQuery(prompt)
+        }
+    }
+
     fun isRefusalToBrowse(text: String): Boolean {
         val lower = text.lowercase()
         return lower.contains("don't have the capability to browse") ||
@@ -551,7 +659,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             p.contains("google ") || p.contains("look up ") || p.contains("find out ") ||
             p.contains("product links") || p.contains("buy links") || p.contains("give links") ||
             p.contains("give product links") || p.contains("search chesi") || p.contains("net lo chusi") ||
-            p.contains("links ivvu")) {
+            p.contains("net lo vethiki") || p.contains("online lo chusi") || p.contains("web research") ||
+            p.contains("research chey") || p.contains("fact check") || p.contains("links ivvu")) {
             return true
         }
 
@@ -871,7 +980,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             isSearchingWeb = useWebSearch,
             isImageAnalysis = isImage,
             isPdfDocumentRequest = isPdfReq,
-            toolExecutionStatus = if (isPdfReq) "Compiling A4 PDF Document..." else null,
+            toolExecutionStatus = if (isPdfReq) "Compiling A4 PDF Document..." else if (useWebSearch) "AI formulating search query..." else null,
             citedPages = promptResult?.citedPages ?: emptyList(),
             sourceFileName = if (isDocument) doc.fileName else null
         )
@@ -983,13 +1092,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             }
                         } catch (_: Exception) {}
                     } else {
-                        // 2. Parallel Web Search + Product Image Execution
+                        // 1. AI Formulates High-Yield Search Keywords First
                         updateSessionMessages(targetSessionId) { msgs ->
                             msgs.map { msg ->
                                 if (msg.id == assistantMessageId) msg.copy(
                                     isSearchingWeb = true,
                                     isExecutingTool = true,
-                                    toolExecutionStatus = if (isProductRequest) "Searching products & specs..." else "Searching web..."
+                                    toolExecutionStatus = "AI formulating search query..."
+                                ) else msg
+                            }
+                        }
+
+                        val searchTargetQuery = formulateAiSearchQuery(cleanQuery, eng)
+
+                        // 2. Parallel Web Search + Product Image Execution with AI-formulated keywords
+                        updateSessionMessages(targetSessionId) { msgs ->
+                            msgs.map { msg ->
+                                if (msg.id == assistantMessageId) msg.copy(
+                                    toolExecutionStatus = if (isProductRequest) "Searching products: $searchTargetQuery" else "Searching web: \"$searchTargetQuery\"..."
                                 ) else msg
                             }
                         }
@@ -998,7 +1118,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 val searchJob = async {
                                     try {
                                         kotlinx.coroutines.withTimeoutOrNull(10000L) {
-                                            searchManager.searchAndReadWithStatus(cleanQuery, maxResults = SearchConfig.DEFAULT_MAX_SEARCH_RESULTS, isProduct = isProductRequest)
+                                            searchManager.searchAndReadWithStatus(searchTargetQuery, maxResults = SearchConfig.DEFAULT_MAX_SEARCH_RESULTS, isProduct = isProductRequest)
                                         }
                                     } catch (t: Throwable) {
                                         Log.w(TAG, "[$TAG] Web search failed", t)
@@ -1011,7 +1131,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 val imageJob = if (shouldSearchImages) {
                                     async {
                                         try {
-                                            val baseVisualQ = searchManager.cleanVisualQuery(cleanQuery)
+                                            val baseVisualQ = searchManager.cleanVisualQuery(searchTargetQuery)
                                             val visualQ = if (isProductRequest && !baseVisualQ.lowercase().contains("product")) {
                                                 "$baseVisualQ product packshot"
                                             } else {
