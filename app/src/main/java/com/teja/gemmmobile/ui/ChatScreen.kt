@@ -2426,6 +2426,61 @@ fun MessageBubble(
                 Spacer(modifier = Modifier.height(10.dp))
             }
 
+            // PDF Compiling Indicator (while generating notes)
+            if (message.isStreaming && (message.isPdfDocumentRequest || message.toolExecutionStatus?.contains("PDF", ignoreCase = true) == true)) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = Color(0xFF241517),
+                    border = BorderStroke(1.dp, Color(0xFFEF4444).copy(alpha = 0.4f)),
+                    modifier = Modifier.padding(vertical = 4.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(13.dp),
+                            color = Color(0xFFEF4444),
+                            strokeWidth = 2.dp
+                        )
+                        Text(
+                            text = "Compiling A4 PDF Document...",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                            color = Color(0xFFFCA5A5),
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+            }
+
+            // Prominent Top PDF Document Card (Ready immediately on stream complete)
+            if (!message.isStreaming && message.generatedPdfPath != null) {
+                GeneratedPdfDocumentCard(
+                    title = message.generatedPdfTitle ?: "Document.pdf",
+                    pageCount = message.generatedPdfPageCount,
+                    filePath = message.generatedPdfPath!!,
+                    onOpen = {
+                        val file = java.io.File(message.generatedPdfPath!!)
+                        if (file.exists()) {
+                            com.teja.gemmmobile.pdf.PdfExporter.openPdf(context, file)
+                        } else {
+                            Toast.makeText(context, "PDF file not found", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    onShare = {
+                        val file = java.io.File(message.generatedPdfPath!!)
+                        if (file.exists()) {
+                            com.teja.gemmmobile.pdf.PdfExporter.sharePdf(context, file, message.generatedPdfTitle ?: "Document")
+                        } else {
+                            Toast.makeText(context, "PDF file not found", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+            }
+
             // Minimal subtle pulsing dot while waiting for first token (ChatGPT style)
             if (effectiveText.isEmpty() && message.isStreaming && message.thoughtText.isEmpty()) {
                 val infiniteTransition = rememberInfiniteTransition(label = "cursorBlink")
@@ -2721,7 +2776,11 @@ fun GeneratedPdfDocumentCard(
     Surface(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp)),
+            .clip(RoundedCornerShape(14.dp))
+            .clickable {
+                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                onOpen()
+            },
         color = Color(0xFF1E2128),
         border = BorderStroke(1.dp, Color(0xFF2E333D))
     ) {

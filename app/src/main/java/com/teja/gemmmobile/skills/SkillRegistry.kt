@@ -17,13 +17,13 @@ class SkillRegistry(private val context: Context) {
 
     val skills: List<GemmaSkill> by lazy {
         listOf(
+            createPdfMakerSkill(),
             createDeviceIntentsSkill(),
             createQrCodeSkill(),
             createWikipediaSkill(),
             createQuizMasterSkill(),
             createCodeReviewerSkill(),
-            createTeluguGuruSkill(),
-            createPdfMakerSkill()
+            createTeluguGuruSkill()
         )
     }
 
@@ -42,7 +42,9 @@ class SkillRegistry(private val context: Context) {
             keywords = listOf(
                 "alarm", "అలారం", "timer", "టైమర్", "whatsapp", "వాట్సాప్",
                 "calendar", "క్యాలెండర్", "reminder", "రిమైండర్", "open app",
-                "ఓపెన్ చెయ్", "పెట్టు", "సేవ్ చెయ్", "open camera", "open settings"
+                "ఓపెన్ చెయ్", "అలారం పెట్టు", "టైమర్ పెట్టు", "రిమైండర్ పెట్టు",
+                "alarm pettu", "timer pettu", "reminder pettu",
+                "సేవ్ చెయ్", "open camera", "open settings"
             ),
             systemDirective = """
                 ## SKILL: DEVICE ACTIONS & INTENTS (device-intents)
@@ -189,17 +191,22 @@ class SkillRegistry(private val context: Context) {
             icon = "📄",
             description = "Formats pure, high-yield study notes or documents into publication-ready PDF files without chat fluff.",
             keywords = listOf(
-                "pdf", "notes pdf", "pdf cheyyi", "cheymante", "pdf format lo",
-                "make pdf", "create pdf", "pdf document", "pdf lo ivvu"
+                "pdf", "పిడిఎఫ్", "పీడీఎఫ్", "పీడిఎఫ్", "notes pdf", "pdf cheyyi", "cheymante",
+                "pdf format lo", "make pdf", "create pdf", "pdf document", "pdf lo", "pdf kavali",
+                "pdf ivvu", "pdf chesi", "pdf file", "export pdf", "download pdf", "pdf chey",
+                "cheatsheet pdf", "pdf rasi", "pdf ivvali", "pdf cheyali", "notes in pdf",
+                "pdf maker"
             ),
             systemDirective = """
                 ## SKILL: STUDY NOTES & PDF DOCUMENT MAKER (pdf-maker)
                 The user requested comprehensive, publication-grade study notes or document in PDF format.
-                1. Structure your output directly as a clean, complete, high-yield study document.
-                2. Start with an informative Document Title (# <Title>).
-                3. Organize the subject into clear, logical sections (## Section) and subsections (### Topic).
-                4. Include comprehensive explanations, formal definitions, detailed bullet points, equations/formulas, and comparison tables or code snippets where appropriate.
-                5. DO NOT output conversational filler like 'Here is your PDF' or 'I cannot create files'. Output the pure, well-structured document directly so the system can compile it into a PDF file.
+                CRITICAL ZERO-REFUSAL MANDATES:
+                1. You are an autonomous document engine. The application natively compiles your exact response directly into an on-device A4 PDF document.
+                2. NEVER say 'I cannot create PDF files', 'As an AI...', or 'Here is the text to save as a PDF'. Output the structured document directly.
+                3. Start directly on line 1 with an informative Document Title (# <Title>).
+                4. Organize the subject into clear, logical sections (## Section) and subsections (### Topic).
+                5. Include comprehensive explanations, formal definitions, detailed bullet points, equations/formulas, and comparison tables where appropriate.
+                6. Absolutely NO conversational filler (no 'Sure!', 'Certainly!', 'Here is...'). Output the pure, well-structured document directly so the system can compile it into a PDF file.
             """.trimIndent()
         )
     }

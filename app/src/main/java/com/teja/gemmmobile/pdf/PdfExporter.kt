@@ -304,13 +304,17 @@ object PdfExporter {
     }
 
     private fun deriveTitle(markdownText: String): String {
-        val firstLine = markdownText.lines().firstOrNull { it.isNotBlank() } ?: "Document Export"
-        val clean = firstLine
+        val headingLine = markdownText.lines().firstOrNull { line ->
+            val trimmed = line.trim()
+            trimmed.startsWith("#") || trimmed.startsWith("**")
+        } ?: markdownText.lines().firstOrNull { it.isNotBlank() } ?: "Study Notes Document"
+
+        val clean = headingLine
             .replace("#", "")
             .replace("*", "")
             .replace("`", "")
             .trim()
-        return if (clean.length > 50) clean.take(47) + "..." else clean.ifEmpty { "Document Export" }
+        return if (clean.length > 50) clean.take(47) + "..." else clean.ifEmpty { "Study Notes Document" }
     }
 
     private fun buildSessionMarkdown(session: ChatSession): String {

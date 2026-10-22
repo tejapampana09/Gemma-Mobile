@@ -75,7 +75,8 @@ data class ChatMessage(
     val isExplicitVisualRequest: Boolean = false,
     val generatedPdfPath: String? = null,
     val generatedPdfTitle: String? = null,
-    val generatedPdfPageCount: Int = 0
+    val generatedPdfPageCount: Int = 0,
+    val isPdfDocumentRequest: Boolean = false
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
@@ -624,14 +625,57 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun isPdfRequest(prompt: String): Boolean {
         val p = prompt.lowercase().trim()
-        if (!p.contains("pdf")) return false
-        val actionKeywords = listOf(
-            "make", "create", "generate", "give", "notes", "cheyyi", "chey",
-            "ivvu", "format", "convert", "export", "doc", "document", "sheet",
-            "summary", "guide", "download", "prepare", "write", "rayi", "pettu",
-            "cheymante", "lo ivvu", "pdf chesi", "pdf lo"
+        val containsPdf = p.contains("pdf") ||
+                          p.contains("p.d.f") ||
+                          p.contains("పిడిఎఫ్") ||
+                          p.contains("పీడీఎఫ్") ||
+                          p.contains("పీడిఎఫ్")
+        if (!containsPdf) return false
+
+        // Informational questions about PDF technology should remain conversational
+        val informationalQueries = listOf(
+            "what is pdf", "what is a pdf", "pdf full form", "full form of pdf",
+            "who invented pdf", "who created pdf", "how does pdf work", "define pdf",
+            "pdf meaning", "pdf ante enti", "pdf ante emiti"
         )
-        return actionKeywords.any { p.contains(it) } || p.endsWith("pdf") || p.startsWith("pdf")
+        if (informationalQueries.any { p.contains(it) }) return false
+
+        return true
+    }
+
+    fun extractPdfTopic(prompt: String): String {
+        var topic = prompt.trim()
+        val removePatterns = listOf(
+            Regex("""(?i)\b(?:please\s+)?(?:make|create|generate|give|export|format|write|prepare)\b"""),
+            Regex("""(?i)\b(?:a\s+)?(?:pdf|p\.d\.f|document|file)\b"""),
+            Regex("""(?i)\b(?:cheyyi|chey|kavali|ivvu|pettu|rasi|cheymante|lo|ga|ante|ey|chesi|ivvali|cheyali)\b"""),
+            Regex("""[పిపీ]డిఎఫ్""")
+        )
+        for (pat in removePatterns) {
+            topic = pat.replace(topic, " ")
+        }
+        topic = topic.replace(Regex("""\s+"""), " ").trim()
+        return topic.ifBlank { prompt.trim() }
+    }
+
+    fun stripPdfDisclaimers(text: String): String {
+        var cleaned = text.trim()
+        val disclaimerPatterns = listOf(
+            // "As an AI, I cannot create PDF files directly..."
+            Regex("""^(?:As an AI|I am an AI|As a language model)[^\n]*?(?:cannot|can't|unable to)[^\n]*?(?:pdf|file|document|download)[^\n]*?\n+""", RegexOption.IGNORE_CASE),
+            // "I cannot create or export PDF files..."
+            Regex("""^I (?:cannot|can't|am unable to|do not have the ability to) (?:directly )?(?:create|generate|export|download|make|save|produce) (?:a |any )?(?:pdf|file|document)[^\n]*?\n+""", RegexOption.IGNORE_CASE),
+            // "Sure! Here is the content formatted for a PDF:"
+            Regex("""^(?:Sure!?|Certainly!?|Here is|Below is|Here are)[^\n]*?(?:notes|content|guide|summary|document)[^\n]*?(?:for (?:your |a )?pdf|to (?:save|export|convert) (?:as|into) (?:a )?pdf)[^\n]*?:?\n+""", RegexOption.IGNORE_CASE),
+            // Conversational opener lines
+            Regex("""^(?:Sure!?|Certainly!?|Of course!?|Here you go!?)\s*\n+""", RegexOption.IGNORE_CASE)
+        )
+        for (pattern in disclaimerPatterns) {
+            cleaned = pattern.replace(cleaned, "").trim()
+        }
+        // Strip trailing chat closing fluffs
+        cleaned = cleaned.replace(Regex("""\n+(?:Hope this helps!?|Let me know if you need (?:more|any other) (?:notes|help|topics)!?|Feel free to ask[^\n]*)\s*$""", RegexOption.IGNORE_CASE), "").trim()
+        return cleaned
     }
 
     fun stripToolCallJson(text: String): String {
@@ -770,8 +814,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
         val isContinue = isContinueRequest(rawInput) && !isImage
         val isDocument = doc != null && !doc.isImage
-        val isVisualRequest = !isContinue && shouldQueryImages(rawInput) && !isImage && !isDocument
-        val useWebSearch = !isContinue && (_isWebSearchEnabled.value || (shouldAutoSearch(rawInput) && !isDocument) || isVisualRequest) && !isImage && !isDocument
+        val isPdfReq = isPdfRequest(rawInput) && !isImage && !isDocument
+        val isVisualRequest = !isContinue && !isPdfReq && shouldQueryImages(rawInput) && !isImage && !isDocument
+        val useWebSearch = !isContinue && !isPdfReq && (_isWebSearchEnabled.value || (shouldAutoSearch(rawInput) && !isDocument) || isVisualRequest) && !isImage && !isDocument
 
         // Direct device action execution (alarms, whatsapp, calendar, timers)
         val directDeviceIntentArgs = if (!isImage && doc == null) {
@@ -822,9 +867,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             text = "",
             thoughtText = "",
             isStreaming = true,
-            isThinking = _config.value.enableThinking && !useWebSearch,
+            isThinking = _config.value.enableThinking && !useWebSearch && !isPdfReq,
             isSearchingWeb = useWebSearch,
             isImageAnalysis = isImage,
+            isPdfDocumentRequest = isPdfReq,
+            toolExecutionStatus = if (isPdfReq) "Compiling A4 PDF Document..." else null,
             citedPages = promptResult?.citedPages ?: emptyList(),
             sourceFileName = if (isDocument) doc.fileName else null
         )
@@ -1029,12 +1076,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val allowTools = !isDocument && !hasDocInSession && imageBytes == null && searchContext.isBlank()
 
                 val isContinue = isContinueRequest(prompt)
-                val matchedSkill = skillRegistry.findMatchingSkill(prompt)
+                val isPdf = isPdfRequest(prompt) && !isDocument && imageBytes == null
+                val matchedSkill = if (isPdf) skillRegistry.skills.firstOrNull { it.id == "pdf-maker" } else skillRegistry.findMatchingSkill(prompt)
                 val effectiveSystemPrompt = when {
                     imageBytes != null -> "You are a helpful assistant. Directly and accurately describe what is in the image in plain language."
                     isContinue -> {
                         "$baseSystemPrompt\n\n## CONTINUATION PROTOCOL\n" +
                         "The user asked to continue the previous explanation. Pick up immediately with the next point without any conversational filler, greetings, or repetition. Deliver the remaining content and wrap up with a natural conclusion."
+                    }
+                    isPdf -> {
+                        "$baseSystemPrompt\n\n## AUTONOMOUS PUBLICATION-GRADE A4 DOCUMENT ENGINE\n" +
+                        "The user requested complete study notes or document to be compiled directly into a PDF.\n" +
+                        "CRITICAL ZERO-REFUSAL MANDATES:\n" +
+                        "1. You are an autonomous document compiler engine. The application natively compiles your exact response directly into an on-device A4 PDF document.\n" +
+                        "2. NEVER say 'I cannot create PDF files', 'As an AI...', or 'Here is the text to save as a PDF'. Output the structured document directly.\n" +
+                        "3. Start IMMEDIATELY on line 1 with the main document title: '# <Title>' (e.g. '# Machine Learning: Comprehensive Guide').\n" +
+                        "4. Organize into comprehensive sections ('## Section Title') and subsections ('### Sub-topic').\n" +
+                        "5. Provide exhaustive, deep coverage: formal definitions, high-yield bullet points, core equations/formulas, comparison markdown tables, and summary takeaways.\n" +
+                        "6. Absolutely NO conversational greetings, chatter, or sign-offs. Start directly at line 1 with '# <Title>'."
                     }
                     searchContext.isNotBlank() -> {
                         "$baseSystemPrompt\n\n" +
@@ -1072,8 +1131,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             val visualSubject = searchManager.cleanVisualQuery(prompt).replace(Regex("""\s+diagram""", RegexOption.IGNORE_CASE), "").trim()
                             "Please provide a comprehensive explanation of the architecture, key components, and workflow of $visualSubject in detail. Structure your answer with clear headings and bullet points."
                         }
-                        isPdfRequest(prompt) -> {
-                            "$prompt\n\n(Please format this directly as a comprehensive, highly structured study document with clear headings (# Title, ## Section), definitions, detailed bullet points, equations/formulas, and key takeaways formatted for a clean PDF document.)"
+                        isPdf -> {
+                            val cleanTopic = extractPdfTopic(prompt)
+                            "Generate a comprehensive, publication-grade study document on: $cleanTopic.\n" +
+                            "Output pure markdown starting with '# $cleanTopic: Complete Study Notes' on line 1, organized with clear section headings (##), detailed explanations, bullet points, comparison tables, and key takeaways."
                         }
                         isContinue -> {
                             val lastAssistant = targetMsgs.lastOrNull { it.role == MessageRole.ASSISTANT && it.id != assistantMessageId && it.text.isNotBlank() }
@@ -1094,7 +1155,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         else -> prompt
                     }
                     val historyTurns = targetMsgs.filter { it.id != assistantMessageId }.dropLast(1)
-                    val allowToolsInPrompt = !isDocument && !hasDocInSession && searchContext.isBlank()
+                    val allowToolsInPrompt = !isDocument && !hasDocInSession && searchContext.isBlank() && !isPdf
                     contextManager.buildPrompt(
                         systemPrompt = "", // Handled natively in ConversationConfig
                         toolsDocumentation = if (allowToolsInPrompt) toolRegistry.getToolsDocumentation() else "",
@@ -1161,8 +1222,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         val now = System.currentTimeMillis()
                         // Throttle UI recompositions to avoid pegging the Main thread on every token
                         if (now - lastUiUpdateTime >= UI_THROTTLE_MS) {
-                            lastUiUpdateTime = now
-                            val currentText = responseBuilder.toString()
+                            val rawStreamingText = responseBuilder.toString()
+                            val currentText = if (isPdf) stripPdfDisclaimers(rawStreamingText) else rawStreamingText
                             val currentThought = thoughtBuilder.toString()
                             val stillThinking = currentText.isEmpty() && currentThought.isNotEmpty()
 
@@ -1371,21 +1432,26 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     else -> "I couldn't generate a response. Please try again with a shorter prompt."
                 }
 
-                val isPdf = isPdfRequest(prompt)
+                val sanitizedResolved = if (isPdf) stripPdfDisclaimers(resolvedText) else resolvedText
+                val finalTextToDisplay = sanitizedResolved.ifBlank { resolvedText }
                 var autoPdfPath: String? = null
                 var autoPdfTitle: String? = null
                 var autoPdfPages = 0
 
-                if (isPdf && resolvedText.isNotBlank()) {
+                if (isPdf && finalTextToDisplay.isNotBlank()) {
                     try {
                         val pdfResult = com.teja.gemmmobile.pdf.PdfExporter.generatePdf(
                             context = getApplication(),
-                            markdownText = resolvedText,
+                            markdownText = finalTextToDisplay,
                             title = null
                         )
                         autoPdfPath = pdfResult.file.absolutePath
                         autoPdfTitle = pdfResult.title
                         autoPdfPages = pdfResult.pageCount
+                        Log.i(TAG, "[$TAG] Auto PDF generated successfully: $autoPdfPath with $autoPdfPages pages")
+                        withContext(Dispatchers.Main) {
+                            android.widget.Toast.makeText(getApplication(), "📄 PDF Ready! Tap 'Open PDF' to view", android.widget.Toast.LENGTH_LONG).show()
+                        }
                     } catch (e: Exception) {
                         Log.w(TAG, "[$TAG] Auto PDF generation error", e)
                     }
@@ -1395,8 +1461,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     msgs.map { msg ->
                         if (msg.id == assistantMessageId) {
                             msg.copy(
-                                text = resolvedText,
-                                thoughtText = if (resolvedText == finalThought) "" else finalThought,
+                                text = finalTextToDisplay,
+                                thoughtText = if (finalTextToDisplay == finalThought) "" else finalThought,
                                 searchResults = searchResults,
                                 searchImages = if (currentSearchImages.isNotEmpty()) currentSearchImages else if (searchImages.isNotEmpty()) searchImages else msg.searchImages,
                                 isStreaming = false,
@@ -1404,6 +1470,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 isSearchingWeb = false,
                                 isExecutingTool = false,
                                 toolExecutionStatus = null,
+                                isPdfDocumentRequest = isPdf,
                                 isExplicitVisualRequest = isExplicitPhotoRequest || isVisualQuery,
                                 generatedPdfPath = autoPdfPath,
                                 generatedPdfTitle = autoPdfTitle,
@@ -1706,18 +1773,21 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun generatePdfForMessage(messageId: String, text: String, title: String? = null) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                val cleanText = stripPdfDisclaimers(text)
                 val result = com.teja.gemmmobile.pdf.PdfExporter.generatePdf(
                     context = getApplication(),
-                    markdownText = text,
+                    markdownText = cleanText.ifBlank { text },
                     title = title
                 )
                 updateSessionMessages(_currentSessionId.value) { msgs ->
                     msgs.map { msg ->
                         if (msg.id == messageId) {
                             msg.copy(
+                                text = cleanText.ifBlank { msg.text },
                                 generatedPdfPath = result.file.absolutePath,
                                 generatedPdfTitle = result.title,
-                                generatedPdfPageCount = result.pageCount
+                                generatedPdfPageCount = result.pageCount,
+                                isPdfDocumentRequest = true
                             )
                         } else msg
                     }
