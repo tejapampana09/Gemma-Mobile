@@ -12,7 +12,9 @@ import com.google.ai.edge.litertlm.LogSeverity
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.SamplerConfig
 import com.google.ai.edge.litertlm.ThinkingConfig
+import com.teja.gemmmobile.context.ContextManager
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -316,25 +318,7 @@ data class EngineChunk(
 
         val effectiveSysPrompt = systemInstruction ?: currentConfig.systemPrompt
         val sysTokens = com.teja.gemmmobile.context.ContextManager.estimateTokens(effectiveSysPrompt)
-        val maxAllowedPromptTokens = 12000
-        val rawPromptTokens = com.teja.gemmmobile.context.ContextManager.estimateTokens(prompt)
-        val safePrompt = if (rawPromptTokens > maxAllowedPromptTokens) {
-            val allowedChars = maxAllowedPromptTokens * 2
-            if (prompt.length > allowedChars) {
-                val half = allowedChars / 2
-                val head = prompt.take(half)
-                val tail = prompt.takeLast(half)
-                "$head\n...[trimmed to fit budget]...\n$tail"
-            } else {
-                prompt
-            }
-        } else {
-            prompt
-        }
-
-        // Sanitize string against null bytes / control codes before passing to JNI / LiteRT-LM C++
-        val jniSafePrompt = safePrompt.filter { it.code >= 32 || it == '\n' || it == '\t' || it == '\r' }
-        var basePromptTokens = com.teja.gemmmobile.context.ContextManager.estimateTokens(jniSafePrompt) + sysTokens
+        val sanitizedPrompt = prompt.filter { it.code >= 32 || it == '\n' || it == '\t' || it == '\r' }
         val effectiveThinking = enableThinkingOverride ?: currentConfig.enableThinking
         val effectiveThinkingBudget = if (effectiveThinking) minOf(currentConfig.thinkingBudget, 160) else 0
 
@@ -350,35 +334,20 @@ data class EngineChunk(
                 attempt++
 
                 val imageTokens = if (currentImageBytes != null) 576 else 0
-                var totalPromptTokens = basePromptTokens + imageTokens
-
-                // For multimodal vision inputs, disable thinking to reserve full KV-cache for generation
-                var currentThinking = if (currentImageBytes != null) false else effectiveThinking
-                var currentThinkBudget = if (currentImageBytes != null) 0 else effectiveThinkingBudget
-
-                var availableForOutput = totalModelMaxContext - totalPromptTokens - currentThinkBudget - safetyMargin
-                if (availableForOutput < 64 && currentThinking) {
-                    currentThinking = false
-                    currentThinkBudget = 0
-                    availableForOutput = totalModelMaxContext - totalPromptTokens - safetyMargin
+                // Reserve system, vision, thinking and output tokens BEFORE trimming.
+                // Character counts are not token budgets, especially for Telugu/Unicode.
+                val currentThinking = currentImageBytes == null && effectiveThinking
+                val currentThinkBudget = if (currentThinking) effectiveThinkingBudget else 0
+                val promptBudget = totalModelMaxContext - sysTokens - imageTokens -
+                    currentThinkBudget - safetyMargin - 64
+                check(promptBudget > 0) {
+                    "System instruction exceeds the context budget. Shorten it and try again."
                 }
-
-                if (availableForOutput < 64) {
-                    // Graceful auto-recovery: trim base prompt to fit rather than crashing LiteRT-LM native layer
-                    val emergencyBudget = totalModelMaxContext - currentThinkBudget - safetyMargin - 200
-                    if (emergencyBudget > 150 && totalPromptTokens > emergencyBudget) {
-                        Log.w(TAG, "[$TAG] Adapting prompt from $totalPromptTokens tokens to $emergencyBudget tokens to avoid context overflow")
-                        val emergencyChars = emergencyBudget * 2
-                        val recoveredPrompt = jniSafePrompt.takeLast(emergencyChars)
-                        basePromptTokens = com.teja.gemmmobile.context.ContextManager.estimateTokens(recoveredPrompt) + sysTokens
-                        totalPromptTokens = basePromptTokens + imageTokens
-                        availableForOutput = (totalModelMaxContext - totalPromptTokens - currentThinkBudget - safetyMargin).coerceAtLeast(64)
-                    } else {
-                        val errorMsg = "Context budget reached ($totalPromptTokens tokens). Maximum context is $totalModelMaxContext tokens. Please start a new chat or shorten the message."
-                        Log.w(TAG, "[$TAG] $errorMsg")
-                        throw IllegalStateException(errorMsg)
-                    }
-                }
+                val jniSafePrompt = ContextManager.trimToTokenBudget(
+                    sanitizedPrompt, minOf(12000, promptBudget)
+                )
+                val totalPromptTokens = ContextManager.estimateTokens(jniSafePrompt) + sysTokens + imageTokens
+                val availableForOutput = totalModelMaxContext - totalPromptTokens - currentThinkBudget - safetyMargin
 
                 val requestedOutput = dynamicMaxOutputOverride ?: currentConfig.maxTokens
                 val dynamicMaxOutput = minOf(requestedOutput, availableForOutput).coerceAtLeast(48)
@@ -421,6 +390,7 @@ data class EngineChunk(
                             visionFlow = targetConv.sendMessageAsync(contents = contents, thinkingConfig = thinkingConfig)
                             Log.d(TAG, "[$TAG] Vision: sending JPEG bytes (${visionBytes.size} bytes)")
                         } catch (e1: Throwable) {
+                            if (e1 is CancellationException) throw e1
                             Log.w(TAG, "[$TAG] Vision JPEG failed: ${e1.message}. Trying PNG re-encode...")
                             // Attempt 2: re-encode to PNG
                             try {
@@ -438,6 +408,7 @@ data class EngineChunk(
                                     Log.d(TAG, "[$TAG] Vision: PNG re-encode succeeded (${pngBytes.size} bytes)")
                                 } else throw IllegalStateException("Bitmap decode failed")
                             } catch (e2: Throwable) {
+                                if (e2 is CancellationException) throw e2
                                 Log.w(TAG, "[$TAG] Vision PNG also failed: ${e2.message}. Emitting error to user.")
                                 // Both formats failed - emit clear message, don't confuse model
                                 emit(EngineChunk(text = "I wasn't able to process this image. The on-device model may not support image inputs, or the image format is unsupported. Try describing what you'd like to know and I'll help with text."))
@@ -487,13 +458,6 @@ data class EngineChunk(
                         throw e
                     }
                     val errStr = e.message.orEmpty()
-                    if (errStr.contains("exceeds available state entries", ignoreCase = true) ||
-                        errStr.contains("Status Code: 9", ignoreCase = true) ||
-                        errStr.contains("capacity", ignoreCase = true)) {
-                        Log.i(TAG, "[$TAG] Reached KV cache capacity limit cleanly. Finalizing generated response without error.")
-                        succeeded = true
-                        break
-                    }
                     if (currentImageBytes != null && attempt < 2) {
                         Log.w(TAG, "[$TAG] Vision generation failed ($errStr), emitting error to user.")
                         emit(EngineChunk(text = "I wasn't able to analyze this image. The model may not support vision on this device. Try describing what's in the image and I'll help with text."))
@@ -505,11 +469,13 @@ data class EngineChunk(
                 }
             }
         } finally {
-            mutex.withLock {
-                try { conversation?.close() } catch (_: Throwable) {}
-                conversation = null
-                if (_engineState.value is EngineState.Generating) {
-                    _engineState.value = EngineState.Ready(activeBackend)
+            withContext(NonCancellable) {
+                mutex.withLock {
+                    try { conversation?.close() } catch (_: Throwable) {}
+                    conversation = null
+                    if (_engineState.value is EngineState.Generating) {
+                        _engineState.value = EngineState.Ready(activeBackend)
+                    }
                 }
             }
         }

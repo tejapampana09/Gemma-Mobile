@@ -29,6 +29,23 @@ class ContextManager(
          * Non-ASCII Indic/Telugu syllables average ~2 tokens per character due to UTF-8 decomposition.
          * Provides realistic upper bounds so prompt size never exceeds the native 2048 KV cache.
          */
+        fun trimToTokenBudget(text: String, maxTokens: Int): String {
+            require(maxTokens >= 0) { "Token budget must be non-negative" }
+            if (estimateTokens(text) <= maxTokens) return text
+            var low = 0
+            var high = text.length
+            while (low < high) {
+                val mid = low + (high - low + 1) / 2
+                if (estimateTokens(text.takeLast(mid)) <= maxTokens) low = mid
+                else high = mid - 1
+            }
+            // Keep recent instructions without splitting a UTF-16 surrogate pair.
+            val start = text.length - low
+            return text.substring(
+                if (start < text.length && text[start].isLowSurrogate()) start + 1 else start
+            )
+        }
+
         fun estimateTokens(text: String): Int {
             if (text.isEmpty()) return 0
             var letters = 0

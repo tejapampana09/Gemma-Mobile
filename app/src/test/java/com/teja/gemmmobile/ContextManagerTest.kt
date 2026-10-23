@@ -10,6 +10,24 @@ import org.junit.Test
 class ContextManagerTest {
 
     @Test
+    fun tokenTrimmingBoundsAsciiSymbolsAndTelugu() {
+        for (text in listOf("hello ".repeat(5000), "?/=&123".repeat(5000), "తెలుగు".repeat(5000))) {
+            for (budget in listOf(0, 1, 64, 512, 12000)) {
+                val trimmed = ContextManager.trimToTokenBudget(text, budget)
+                assertTrue(ContextManager.estimateTokens(trimmed) <= budget)
+                assertTrue(text.endsWith(trimmed))
+            }
+        }
+    }
+
+    @Test
+    fun tokenTrimmingPreservesShortPromptsAndSurrogatePairs() {
+        assertTrue(ContextManager.trimToTokenBudget("Hello", 64) == "Hello")
+        val trimmed = ContextManager.trimToTokenBudget("😀😀", 2)
+        assertTrue(trimmed.isEmpty() || !trimmed.first().isLowSurrogate())
+    }
+
+    @Test
     fun testBuildPromptIncludesAllComponents() {
         val manager = ContextManager(maxContextTokens = 2000)
         val history = listOf(
