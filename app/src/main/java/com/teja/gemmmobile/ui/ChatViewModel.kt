@@ -32,6 +32,7 @@ import com.teja.gemmmobile.memory.AutonomousBrainMemoryHelper
 import com.teja.gemmmobile.memory.MemoryBrainAction
 import com.teja.gemmmobile.search.SearchResult
 import com.teja.gemmmobile.search.SearchImage
+import com.teja.gemmmobile.search.SearchPolicy
 import com.teja.gemmmobile.search.SearchConfig
 import com.teja.gemmmobile.search.WebSearchClient
 import com.teja.gemmmobile.audio.TtsManager
@@ -64,6 +65,7 @@ data class ChatMessage(
     val isStreaming: Boolean = false,
     val isThinking: Boolean = false,
     val isSearchingWeb: Boolean = false,
+    val webSearchFailed: Boolean = false,
     val isImageAnalysis: Boolean = false,
     @Transient val imageBitmap: Bitmap? = null,
     val imagePath: String? = null,
@@ -491,7 +493,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 break
             }
         }
-        return q.ifBlank { raw.trim() }
+        val prior = history.filter { it.text.isNotBlank() && it.text != raw && !it.isStreaming }
+        return SearchPolicy.resolveQuery(
+            q.ifBlank { raw.trim() },
+            prior.lastOrNull { it.role == MessageRole.USER }?.text.orEmpty(),
+            prior.lastOrNull { it.role == MessageRole.ASSISTANT }?.text.orEmpty()
+        )
     }
 
     /**
@@ -548,59 +555,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         return q.ifBlank { raw.trim() }
     }
 
-    /**
-     * Uses Gemma SLM on-device to formulate 2 to 5 high-yield search engine keywords
-     * from conversational or multilingual/Telugu user requests before hitting DuckDuckGo/Web.
-     * Features a strict 2.5s timeout with automatic fast fallback.
-     */
-    private suspend fun formulateAiSearchQuery(prompt: String, eng: GemmaEngine): String {
-        val words = prompt.trim().split(Regex("""\s+"""))
-        val isTelugu = prompt.any { it.code in 0x0C00..0x0C7F }
-        val isConversational = words.size > 4 || isTelugu || prompt.contains("?") ||
-                listOf("tell", "what", "how", "cheppu", "bro", "eeroju", "undhi", "lo", "who", "which").any { prompt.lowercase().contains(it) }
-
-        if (!isConversational && words.size in 1..4) {
-            return prompt.trim()
-        }
-
-        return try {
-            kotlinx.coroutines.withTimeoutOrNull(2500L) {
-                val cleanUserPrompt = prompt.take(160).replace("\"", "")
-                val systemPrompt = "You are an AI Search Query Formulator. Given a user question, output ONLY 2 to 5 concise English search keywords optimized for search engines. Translate regional languages to English. Output NO quotes, NO explanation, NO conversational filler. Only keywords."
-                val userPrompt = "User request: \"$cleanUserPrompt\"\nKeywords:"
-
-                val chunks = StringBuilder()
-                eng.sendMessage(
-                    prompt = userPrompt,
-                    systemInstruction = systemPrompt,
-                    enableThinkingOverride = false,
-                    dynamicMaxOutputOverride = 16
-                ).collect { chunk ->
-                    if (chunk.text.isNotBlank()) {
-                        chunks.append(chunk.text)
-                    }
-                }
-
-                val result = chunks.toString().trim()
-                    .lines().firstOrNull { it.isNotBlank() } ?: ""
-                var clean = result
-                    .replace(Regex("""^["'`*-]+"""), "")
-                    .replace(Regex("""["'`]+$"""), "")
-                    .replace(Regex("""^(keywords|query|search query|search for):\s*""", RegexOption.IGNORE_CASE), "")
-                    .trim()
-
-                if (clean.isNotBlank() && clean.length > 2 && !clean.contains("cannot", ignoreCase = true) && !clean.contains("as an ai", ignoreCase = true)) {
-                    Log.i(TAG, "[$TAG] AI formulated search query: '$clean' from prompt: '$prompt'")
-                    clean
-                } else {
-                    fallbackNormalizeQuery(prompt)
-                }
-            } ?: fallbackNormalizeQuery(prompt)
-        } catch (t: Throwable) {
-            Log.w(TAG, "[$TAG] AI query formulation failed or timed out, using fallback", t)
-            fallbackNormalizeQuery(prompt)
-        }
-    }
 
     fun isRefusalToBrowse(text: String): Boolean {
         val lower = text.lowercase()
@@ -653,6 +607,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (p.contains("pdf") || p.contains("document") || p.contains("this file") || p.contains("my file") || p.contains("my notes") || p.contains("in the notes")) {
             return false
         }
+
+        if (SearchPolicy.isFollowUp(prompt) &&
+            _messages.value.lastOrNull { it.role == MessageRole.ASSISTANT && it.text.isNotBlank() }
+                ?.searchResults?.isNotEmpty() == true) return true
 
         // 1. Explicit search command from user
         if (p.startsWith("search ") || p.startsWith("web search ") || p.startsWith("browse ") ||
@@ -1065,7 +1023,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             isSearchingWeb = useWebSearch,
             isImageAnalysis = isImage,
             isPdfDocumentRequest = isPdfReq,
-            toolExecutionStatus = if (isPdfReq) "Compiling A4 PDF Document..." else if (useWebSearch) "AI formulating search query..." else null,
+            toolExecutionStatus = if (isPdfReq) "Compiling A4 PDF Document..." else if (useWebSearch) "Preparing web search…" else null,
             citedPages = promptResult?.citedPages ?: emptyList(),
             sourceFileName = if (isDocument) doc.fileName else null
         )
@@ -1123,6 +1081,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 var searchResults: List<SearchResult> = emptyList()
                 var searchImages: List<SearchImage> = emptyList()
                 var searchContext = ""
+                var searchFailure: String? = null
 
                 val sessionSnapshot = _sessions.value.find { it.id == targetSessionId }
                 val targetMsgs = sessionSnapshot?.messages ?: _messages.value
@@ -1142,7 +1101,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         lowerPrompt.contains("chudu") ||
                         lowerPrompt.contains("bomma") ||
                         lowerPrompt.contains("wallpaper")
-                val effectiveUseWebSearch = useWebSearch && !isDocument && !hasDocInSession
+                val effectiveUseWebSearch = useWebSearch && !isDocument
 
                 if (effectiveUseWebSearch || isVisualQuery) {
                     if (isVisualQuery) {
@@ -1163,6 +1122,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 searchManager.searchImages(visualSearchQuery, maxImages = 6)
                             } ?: emptyList()
                         } catch (e: Exception) {
+                            if (e is kotlinx.coroutines.CancellationException) throw e
                             Log.w(TAG, "[$TAG] Visual search error", e)
                         }
 
@@ -1177,20 +1137,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             }
                         } catch (_: Exception) {}
                     } else {
-                        // 1. AI Formulates High-Yield Search Keywords First
+                        // 1. Preserve the full question and resolve conversational references
                         updateSessionMessages(targetSessionId) { msgs ->
                             msgs.map { msg ->
                                 if (msg.id == assistantMessageId) msg.copy(
                                     isSearchingWeb = true,
                                     isExecutingTool = true,
-                                    toolExecutionStatus = "AI formulating search query..."
+                                    toolExecutionStatus = "Preparing web search…"
                                 ) else msg
                             }
                         }
 
-                        val searchTargetQuery = formulateAiSearchQuery(cleanQuery, eng)
+                        val searchTargetQuery = cleanQuery // Preserve dates, budgets, names and follow-up context.
 
-                        // 2. Parallel Web Search + Product Image Execution with AI-formulated keywords
+                        // 2. Search pages and optional product images concurrently
                         updateSessionMessages(targetSessionId) { msgs ->
                             msgs.map { msg ->
                                 if (msg.id == assistantMessageId) msg.copy(
@@ -1203,9 +1163,21 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 val searchJob = async {
                                     try {
                                         kotlinx.coroutines.withTimeoutOrNull(10000L) {
-                                            searchManager.searchAndReadWithStatus(searchTargetQuery, maxResults = SearchConfig.DEFAULT_MAX_SEARCH_RESULTS, isProduct = isProductRequest)
+                                            searchManager.searchAndReadWithStatus(
+                                                searchTargetQuery,
+                                                maxResults = SearchConfig.DEFAULT_MAX_SEARCH_RESULTS,
+                                                isProduct = isProductRequest,
+                                                onProgress = { status ->
+                                                    updateSessionMessages(targetSessionId) { messages ->
+                                                        messages.map { message ->
+                                                            if (message.id == assistantMessageId) message.copy(toolExecutionStatus = status) else message
+                                                        }
+                                                    }
+                                                }
+                                            )
                                         }
                                     } catch (t: Throwable) {
+                                        if (t is kotlinx.coroutines.CancellationException) throw t
                                         Log.w(TAG, "[$TAG] Web search failed", t)
                                         null
                                     }
@@ -1232,6 +1204,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 } else null
 
                                 val searchResp = searchJob.await()
+                                searchFailure = when {
+                                    searchResp == null -> "Web search timed out or could not connect."
+                                    searchResp.results.isEmpty() -> "Web search returned no usable sources (${searchResp.status})."
+                                    else -> null
+                                }
                                 if (searchResp != null && searchResp.results.isNotEmpty()) {
                                     searchResults = searchResp.results.map { it.toSearchResult() }
                                     searchContext = searchManager.formatGemmaWebContext(searchResp.results)
@@ -1256,6 +1233,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 }
                             }
                         } catch (t: Throwable) {
+                            if (t is kotlinx.coroutines.CancellationException) throw t
                             Log.w(TAG, "[$TAG] Web & product search failed", t)
                         }
                     }
@@ -1272,6 +1250,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             ) else msg
                         }
                     }
+                }
+
+                if (effectiveUseWebSearch && !isVisualQuery && searchResults.isEmpty()) {
+                    val text = "${searchFailure ?: "Web search could not retrieve sources."} " +
+                        "I couldn't verify an answer from the web. Check your connection or search provider settings, then tap Retry."
+                    updateSessionMessages(targetSessionId) { messages ->
+                        messages.map { message ->
+                            if (message.id == assistantMessageId) message.copy(
+                                text = text, isStreaming = false, isThinking = false,
+                                isSearchingWeb = false, isExecutingTool = false,
+                                toolExecutionStatus = null, webSearchFailed = true
+                            ) else message
+                        }
+                    }
+                    _sessions.value.find { it.id == targetSessionId }?.let { chatStorage.saveSession(it) }
+                    return@launch
                 }
 
                 // Retrieve persistent memories and history using ContextManager
@@ -1303,10 +1297,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     searchContext.isNotBlank() -> {
                         "$baseSystemPrompt\n\n" +
-                        "Verified live web search results are provided above, numbered [1], [2], [3], etc.\n" +
+                        "Retrieved web evidence is provided, numbered [1], [2], [3], etc. Retrieval does not verify a claim.\n" +
                         "Answer the user's question clearly, accurately, and naturally based ONLY on the provided search results.\n" +
                         "When citing sources, use standard bracket numbers matching the search results (e.g. [1] or [2]).\n" +
-                        "CRITICAL: NEVER fabricate, invent, or hallucinate URLs or links. Only state verified facts from the search results.\n" +
+                        "CRITICAL: NEVER fabricate, invent, or hallucinate URLs or links. Cite only source IDs whose supplied text supports the adjacent claim. Distinguish snippet-only evidence from fetched pages. If evidence is incomplete, stale, or conflicting, say so. Do not guess missing facts.\n" +
                         "Respond in the same language as the user's message (English or Telugu)."
                     }
                     matchedSkill != null -> {
@@ -1956,6 +1950,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun regenerateLastResponse() {
         val msgs = _messages.value
+        val retryWebSearch = msgs.lastOrNull()?.webSearchFailed == true
         val lastUserIndex = msgs.indexOfLast { it.role == MessageRole.USER }
         if (lastUserIndex == -1) return
         val userMsg = msgs[lastUserIndex]
@@ -1974,7 +1969,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             text = "",
             isStreaming = true,
             isThinking = _config.value.enableThinking,
-            isSearchingWeb = _isWebSearchEnabled.value,
+            isSearchingWeb = retryWebSearch || _isWebSearchEnabled.value,
             isImageAnalysis = userMsg.isImageAnalysis
         )
 
@@ -1988,7 +1983,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
         val prompt = if (userMsg.text.isNotBlank()) userMsg.text else "What is in this image? Describe clearly."
 
-        val useSearch = (_isWebSearchEnabled.value || shouldAutoSearch(prompt)) && imageBytesToSend == null
+        val useSearch = (retryWebSearch || _isWebSearchEnabled.value || shouldAutoSearch(prompt)) && imageBytesToSend == null
 
         val isVisual = shouldQueryImages(prompt) && imageBytesToSend == null
         startGeneration(

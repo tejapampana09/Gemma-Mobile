@@ -44,13 +44,14 @@ class WebSearchTool(
             return ToolResult.failure("Invalid arguments: 'query' exceeds maximum length limit of ${SearchConfig.MAX_TOOL_ARG_STRING_CHARS} characters.")
         }
 
-        val results = withTimeoutOrNull(10000L) {
-            searchManager.searchAndRead(query, maxResults = SearchConfig.DEFAULT_MAX_SEARCH_RESULTS)
-        } ?: emptyList()
-
-        if (results.isEmpty()) {
-            return ToolResult.success("No relevant web search results found for: \"$query\".", data = emptyList<SearchResult>())
+        val response = withTimeoutOrNull(15000L) {
+            searchManager.searchAndReadWithStatus(query, maxResults = SearchConfig.DEFAULT_MAX_SEARCH_RESULTS)
+        } ?: return ToolResult.failure("Web search timed out. Retry the search; do not invent current facts.")
+        if (response.status != com.teja.gemmmobile.search.SearchStatus.SUCCESS) {
+            return ToolResult.failure("Web search: ${response.status}. ${response.errorMessage.orEmpty()}")
         }
+        val results = response.results
+        if (results.isEmpty()) return ToolResult.failure("No relevant sources were found for this question.")
 
         val formatted = searchManager.formatGemmaWebContext(results)
         return ToolResult.success(formatted, data = results.map { it.toSearchResult() })

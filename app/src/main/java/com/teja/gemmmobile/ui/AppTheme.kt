@@ -16,8 +16,8 @@ enum class AppTheme(
     val accent: Color
 ) {
     CHATGPT_DARK(
-        title = "ChatGPT Dark",
-        subtitle = "Official dark charcoal theme",
+        title = "Gemma Dark",
+        subtitle = "Clean charcoal with a green accent",
         background = Color(0xFF171717),
         surface = Color(0xFF212121),
         userBubble = Color(0xFF2F2F2F),

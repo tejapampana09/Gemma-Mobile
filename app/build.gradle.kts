@@ -4,6 +4,15 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// Personal development only: never commit keys or ship provider secrets in a public APK.
+val localSecrets = java.util.Properties().apply {
+    val source = rootProject.file("local.properties")
+    if (source.exists()) source.inputStream().use { load(it) }
+}
+fun secretLiteral(name: String): String = "\"" +
+    (localSecrets.getProperty(name) ?: System.getenv(name) ?: "")
+        .replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "").replace("\r", "") + "\""
+
 android {
     namespace = "com.teja.gemmmobile"
     compileSdk = 35
@@ -12,6 +21,8 @@ android {
         applicationId = "com.teja.gemmmobile"
         minSdk = 26
         targetSdk = 35
+        buildConfigField("String", "SERPAPI_API_KEY", secretLiteral("SERPAPI_API_KEY"))
+        buildConfigField("String", "SERPER_API_KEY", secretLiteral("SERPER_API_KEY"))
         versionCode = 1
         versionName = "1.0"
 
@@ -47,6 +58,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     testOptions {

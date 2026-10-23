@@ -20,7 +20,7 @@ object SearchConfig {
     const val MAX_AVATAR_DIMENSION = 200
 
     // Content Length & Concurrency Caps
-    const val MAX_PAGE_CONTENT_CHARS = 2400
+    const val MAX_PAGE_CONTENT_CHARS = 16000
     const val MAX_REDIRECTS = 3
     const val DEFAULT_MAX_SEARCH_RESULTS = 5
     const val MAX_PAGES_TO_FETCH = 3
@@ -33,7 +33,7 @@ object SearchConfig {
     const val MAX_TOOL_STEPS = 2
 
     // SerpApi Integration (Google Search & Google Shopping in India)
-    const val SERPAPI_API_KEY = "77a8af2e3411caef9992f78048d65849e220f0d0d5469bb91edca1993b8567de"
+    val SERPAPI_API_KEY: String get() = com.teja.gemmmobile.BuildConfig.SERPAPI_API_KEY
     const val SERPAPI_BASE_URL = "https://serpapi.com/search.json"
     const val SERPAPI_CONNECT_TIMEOUT_MS = 4500
     const val SERPAPI_READ_TIMEOUT_MS = 5500
@@ -41,7 +41,7 @@ object SearchConfig {
     const val SERPAPI_LANGUAGE = "en"
 
     // Serper.dev Integration (Disabled as requested by user to conserve credits)
-    const val SERPER_API_KEY = ""
+    val SERPER_API_KEY: String get() = com.teja.gemmmobile.BuildConfig.SERPER_API_KEY
     const val SERPER_BASE_URL = "https://google.serper.dev"
     const val SERPER_CONNECT_TIMEOUT_MS = 4000
     const val SERPER_READ_TIMEOUT_MS = 5000

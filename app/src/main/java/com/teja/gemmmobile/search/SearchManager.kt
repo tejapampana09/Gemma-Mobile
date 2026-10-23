@@ -1,6 +1,7 @@
 package com.teja.gemmmobile.search
 
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -77,7 +78,7 @@ data class EnrichedSearchResult(
  * Uses Serper.dev (1,900+ queries) and SerpApi (230+ queries) as primary providers
  * for 100% genuine products, live INR prices, packshot images, and direct store URLs.
  * Seamlessly falls back to on-device zero-cost DuckDuckGo Lite & Wikipedia if API quotas run out.
- * Includes a 24-hour smart LRU cache to conserve API credits.
+ * Includes bounded, freshness-aware caching to conserve API credits.
  */
 open class SearchManager(
     private val webSearchClient: WebSearchClient = WebSearchClient(),
@@ -91,9 +92,10 @@ open class SearchManager(
             "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
             "fbclid", "gclid", "ref", "ved", "usqp", "source", "srsltid"
         )
-        private val searchCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, SearchResponse>>()
-        private const val CACHE_TTL_MS = 24 * 60 * 60 * 1000L // 24 hours
+        private const val MAX_CACHE_ENTRIES = 64
     }
+
+    private val searchCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, SearchResponse>>()
 
     /**
      * Sanitizes user input queries by stripping filler conversational commands.
@@ -197,7 +199,8 @@ open class SearchManager(
     open suspend fun searchAndReadWithStatus(
         query: String,
         maxResults: Int = SearchConfig.DEFAULT_MAX_SEARCH_RESULTS,
-        isProduct: Boolean = false
+        isProduct: Boolean = false,
+        onProgress: suspend (String) -> Unit = {}
     ): SearchResponse = withContext(Dispatchers.IO) {
         val cleanQuery = sanitizeQuery(query)
         if (cleanQuery.isBlank()) {
@@ -206,14 +209,16 @@ open class SearchManager(
 
         Log.d(TAG, "[$TAG] Executing searchAndRead for query: \"$cleanQuery\" (isProduct=$isProduct)")
 
-        // 0. Check 24-hour in-memory cache to save API credits
-        val cacheKey = "$isProduct:${cleanQuery.lowercase()}"
+        // 0. Cache according to query freshness and requested result count
+        val cacheKey = "$isProduct:$maxResults:${cleanQuery.lowercase()}"
+        val cacheTtl = SearchPolicy.cacheTtlMillis(cleanQuery, isProduct)
         val cached = searchCache[cacheKey]
-        if (cached != null && System.currentTimeMillis() - cached.first < CACHE_TTL_MS) {
-            Log.d(TAG, "[$TAG] Returning 24h cached search response for: \"$cleanQuery\"")
+        if (cached != null && System.currentTimeMillis() - cached.first in 0 until cacheTtl) {
+            Log.d(TAG, "[$TAG] Returning cached search response for: \"$cleanQuery\"")
             return@withContext cached.second
         }
 
+        onProgress("Searching the web")
         // 1. Primary Engine: Serper.dev (Google Search & Google Shopping in India)
         var searchResultCandidate: SerpApiResult? = null
         if (serperClient.isAvailable()) {
@@ -223,6 +228,7 @@ open class SearchManager(
                     Log.d(TAG, "[$TAG] Serper.dev returned ${searchResultCandidate.results.size} results and ${searchResultCandidate.images.size} images")
                 }
             } catch (t: Throwable) {
+                if (t is CancellationException) throw t
                 Log.w(TAG, "[$TAG] Serper.dev search failed: ${t.localizedMessage}")
             }
         }
@@ -235,6 +241,7 @@ open class SearchManager(
                     Log.d(TAG, "[$TAG] SerpApi returned ${searchResultCandidate.results.size} results and ${searchResultCandidate.images.size} images")
                 }
             } catch (t: Throwable) {
+                if (t is CancellationException) throw t
                 Log.w(TAG, "[$TAG] SerpApi search failed: ${t.localizedMessage}")
             }
         }
@@ -250,6 +257,7 @@ open class SearchManager(
                 rawResults = webSearchClient.search(cleanQuery, maxResults = 12)
                 rawImages = emptyList()
             } catch (t: Throwable) {
+                if (t is CancellationException) throw t
                 Log.w(TAG, "[$TAG] Web search failed: ${t.localizedMessage}")
                 val isTimeout = t is java.net.SocketTimeoutException
                 val status = if (isTimeout) SearchStatus.TIMEOUT else SearchStatus.PROVIDER_ERROR
@@ -287,6 +295,7 @@ open class SearchManager(
             }
         }
 
+        onProgress("Reading ${eligibleIndicesToFetch.size} pages")
         val enrichedList = coroutineScope {
             val deferredEnriched = rankedResults.mapIndexed { idx, res ->
                 async {
@@ -303,12 +312,13 @@ open class SearchManager(
                                 }
 
                                 if (fetched != null && fetched.success && fetched.content.isNotBlank() && !isAuthOrLoginText(fetched.content)) {
-                                    fetchedContent = fetched.content
+                                    fetchedContent = SearchPolicy.selectPassages(fetched.content, cleanQuery, 2400)
                                     fetchSuccess = true
                                     if (fetchedImage == null) fetchedImage = fetched.imageUrl
                                 }
                             }
                         } catch (t: Throwable) {
+                            if (t is CancellationException) throw t
                             Log.w(TAG, "[$TAG] Error fetching ${res.url}: ${t.localizedMessage}")
                         }
                     }
@@ -328,12 +338,20 @@ open class SearchManager(
             deferredEnriched.awaitAll()
         }
 
+        onProgress("Preparing answer from ${enrichedList.size} sources")
         val response = SearchResponse(
             status = SearchStatus.SUCCESS,
             results = enrichedList,
             images = rawImages
         )
-        searchCache[cacheKey] = Pair(System.currentTimeMillis(), response)
+        if (cacheTtl > 0) {
+            synchronized(searchCache) {
+                if (searchCache.size >= MAX_CACHE_ENTRIES) {
+                    searchCache.entries.minByOrNull { it.value.first }?.let { searchCache.remove(it.key) }
+                }
+                searchCache[cacheKey] = Pair(System.currentTimeMillis(), response)
+            }
+        }
         return@withContext response
     }
 
@@ -571,43 +589,25 @@ open class SearchManager(
     ): String {
         if (results.isEmpty()) return ""
 
-        val sb = StringBuilder()
-        sb.appendLine("## LIVE WEB RESULTS (UNTRUSTED EXTERNAL DATA)")
-        sb.appendLine("<WEB_SOURCE_UNTRUSTED_DATA>")
-
-        var currentChars = sb.length
-
-        for ((idx, res) in results.take(SearchConfig.DEFAULT_MAX_SEARCH_RESULTS).withIndex()) {
-            val itemSb = StringBuilder()
-            val cleanTitle = res.title.take(160).replace(Regex("""[\x00-\x1F\x7F]"""), " ").trim()
-            val cleanUrl = res.url.take(300).replace(Regex("""[\x00-\x1F\x7F]"""), "").trim()
-            val cleanSnippet = res.snippet.take(800).replace(Regex("""[\x00-\x1F\x7F]"""), " ").trim()
-            val domain = extractDomain(cleanUrl).ifBlank { "source" }
-
-            itemSb.appendLine("[${idx + 1}] [$domain] Title: $cleanTitle")
-            itemSb.appendLine("Source URL: $cleanUrl")
-            if (cleanUrl.contains("linkedin.com/in/")) {
-                itemSb.appendLine("Profile Summary: $cleanSnippet")
-            } else {
-                itemSb.appendLine("Snippet: $cleanSnippet")
-            }
-
-            if (res.fetchSucceeded && res.pageContent.isNotBlank() && !isAuthOrLoginText(res.pageContent)) {
-                val boundedPageContent = res.pageContent.take(1400).replace(Regex("""[\x00-\x1F\x7F]"""), " ").trim()
-                itemSb.appendLine("Scraped Webpage Content: $boundedPageContent")
-            }
-            itemSb.appendLine()
-
-            if (currentChars + itemSb.length > maxTotalChars && idx > 0) {
-                break
-            }
-
-            sb.append(itemSb)
-            currentChars += itemSb.length
+        val header = "## LIVE WEB RESULTS (UNTRUSTED EXTERNAL DATA)\n<WEB_SOURCE_UNTRUSTED_DATA>\n"
+        val footer = "</WEB_SOURCE_UNTRUSTED_DATA>"
+        if (maxTotalChars < header.length + footer.length) return ""
+        val sources = results.take(SearchConfig.DEFAULT_MAX_SEARCH_RESULTS)
+        val perSource = (maxTotalChars - header.length - footer.length) / sources.size
+        val sb = StringBuilder(header)
+        fun clean(value: String) = value.replace(Regex("[\\x00-\\x1F\\x7F]"), " ")
+            .replace("<", "&lt;").replace(">", "&gt;").trim()
+        for ((idx, res) in sources.withIndex()) {
+            val metadata = "[${idx + 1}] Title: ${clean(res.title).take(120)}\n" +
+                "Source URL: ${clean(res.url).take(300)}\n" +
+                "Evidence: ${if (res.fetchSucceeded) "fetched webpage" else "search snippet only"}\n"
+            val label = if (res.fetchSucceeded) "Webpage Text: " else "Snippet: "
+            val remaining = perSource - metadata.length - label.length - 2
+            if (remaining < 0) break
+            val evidence = if (res.fetchSucceeded && res.pageContent.isNotBlank()) res.pageContent else res.snippet
+            sb.append(metadata).append(label).append(clean(evidence).take(remaining)).append("\n\n")
         }
-
-        sb.appendLine("</WEB_SOURCE_UNTRUSTED_DATA>")
-        return sb.toString().trim()
+        return sb.append(footer).toString()
     }
 
     private fun isAuthOrLoginText(text: String): Boolean {

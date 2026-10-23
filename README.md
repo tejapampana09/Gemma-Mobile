@@ -109,3 +109,34 @@ adb logcat -s GemmaMobile
 - `[GemmaMobile] Backend: GPU` *(or `[GemmaMobile] GPU failed, falling back to CPU`)*
 - `[GemmaMobile] Starting generation`
 - `[GemmaMobile] Generation complete`
+
+## Search and chat experience
+
+- Follow-up searches include recent question/answer context; dates, budgets and names are preserved instead of compressing requests to five keywords.
+- Retrieved page passages are ranked against the query and divided across a fixed evidence budget. Snippets are distinguished from fetched pages. Citations point to exact result URLs.
+- Search caching is instance-scoped, includes the result limit, and is capped at 64 entries. General searches expire after an hour; news/weather/products after five minutes. Explicit refresh and selected live queries bypass it.
+- Failed text web lookups stop with a Retry action rather than synthesizing unsupported current facts.
+- The chat has a responsive welcome screen, stable-width composer, larger primary touch targets, animated search stages, and no forced scroll to the bottom at completion.
+
+### Personal search-provider setup
+
+The previously committed provider key has been removed from source. **Revoke/rotate it with the provider: removing it from a new commit does not remove it from Git history.**
+
+For your personal development build, add newly issued credentials to the ignored `local.properties` file (alongside `sdk.dir`) or environment variables:
+
+```properties
+SERPAPI_API_KEY=your-new-key
+SERPER_API_KEY=your-key-if-used
+```
+
+Without these, the public-search fallback still runs, but can be rate-limited or blocked. These development values become part of the APK; a distributed app needs a backend proxy with server-side credentials, authentication and rate limits. No backend is provisioned by this change.
+
+### Verification
+
+```bash
+./gradlew testDebugUnitTest assembleDebug
+```
+
+On a phone or emulator, check: a long message at narrow width, keyboard open/closed, larger accessibility fonts, reading earlier messages while streaming, a follow-up comparison, offline search and Retry, two citations from the same website, and Stop during page fetching. New automated tests cover follow-up queries, passage selection, cache policy, context limits, cancellation and exact citation URLs.
+
+This improves retrieval and interaction. It does not provide ChatGPT model parity, JavaScript browser execution, or comprehensive fact verification. Existing document-attachment and image paths retain their own limits.

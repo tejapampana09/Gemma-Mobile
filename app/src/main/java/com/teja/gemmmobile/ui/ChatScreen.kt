@@ -579,21 +579,15 @@ fun ChatScreen(
                 if (!isGenerating) break
                 if (!listState.isScrollInProgress && messages.isNotEmpty()) {
                     val totalItems = listState.layoutInfo.totalItemsCount
-                    val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-                    // Only auto-scroll when within 3 items of the bottom
-                    if (totalItems > 0 && lastVisible >= totalItems - 3) {
+                    val layout = listState.layoutInfo
+                    val lastVisible = layout.visibleItemsInfo.lastOrNull()
+                    val nearBottom = lastVisible != null && lastVisible.index == totalItems - 1 &&
+                        lastVisible.offset + lastVisible.size <= layout.viewportEndOffset + 120
+                    if (totalItems > 0 && nearBottom) {
                         listState.scrollToItem(messages.size)
                     }
                 }
             }
-        }
-    }
-
-    // After generation finishes: always scroll to bottom so the full response is visible
-    LaunchedEffect(isGenerating) {
-        if (!isGenerating && messages.isNotEmpty()) {
-            kotlinx.coroutines.delay(80L) // let Compose layout settle
-            listState.animateScrollToItem(messages.size)
         }
     }
 
@@ -950,14 +944,17 @@ fun ChatScreen(
                             EmptyChatHero(
                                 onPromptSelected = { prompt ->
                                     viewModel.onInputTextChanged(prompt)
-                                    viewModel.sendMessage()
                                 },
                                 onExamineSelected = {
                                     imagePickerLauncher.launch("image/*")
                                 },
                                 modifier = Modifier
-                                    .fillMaxWidth()
                                     .widthIn(max = 840.dp)
+                                    .fillMaxWidth()
+                                    .padding(
+                                        top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 56.dp,
+                                        bottom = effectiveBottomInset + inputDockHeightDp + 16.dp
+                                    )
                             )
                         } else {
                             val onSpeakStable = remember(viewModel) {
@@ -979,8 +976,8 @@ fun ChatScreen(
                             LazyColumn(
                                 state = listState,
                                 modifier = Modifier
-                                    .fillMaxWidth()
                                     .widthIn(max = 840.dp)
+                                    .fillMaxWidth()
                                     .fillMaxHeight()
                                     .nestedScroll(pullToNewChatConnection)
                                     .graphicsLayer {
@@ -997,6 +994,7 @@ fun ChatScreen(
                                 items(messages, key = { it.id }) { message ->
                                     MessageBubble(
                                         message = message,
+                                        isLatest = message.id == messages.lastOrNull()?.id,
                                         isSpeaking = isSpeaking && currentlySpeakingId == message.id,
                                         onSpeak = onSpeakStable,
                                         onShare = onShareStable,
@@ -2064,100 +2062,7 @@ fun EmptyChatHero(
     onExamineSelected: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
-    val navBottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
-    val haptic = LocalHapticFeedback.current
-
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .padding(
-                start = 16.dp,
-                end = 16.dp,
-                top = 28.dp,
-                bottom = navBottom + 76.dp
-            ),
-        verticalArrangement = Arrangement.SpaceBetween
-    ) {
-        // Centered ChatGPT-style greeting and emblem
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Surface(
-                shape = CircleShape,
-                color = Color(0xFF212121),
-                border = BorderStroke(1.dp, Color(0xFF323232)),
-                modifier = Modifier.size(64.dp)
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Text(text = "✦", fontSize = 32.sp, color = Color(0xFFFA70AB))
-                }
-            }
-
-            Spacer(modifier = Modifier.height(20.dp))
-
-            Text(
-                text = "What can I help with?",
-                style = MaterialTheme.typography.titleLarge.copy(
-                    fontSize = 22.sp,
-                    fontWeight = FontWeight.SemiBold
-                ),
-                color = Color.White
-            )
-
-            Spacer(modifier = Modifier.height(6.dp))
-
-            Text(
-                text = "On-device • 100% Private • Gemma 2B",
-                style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF8E8E93)
-            )
-        }
-
-        // Horizontal scrolling suggestion pills (ConversationComposerPill - ect0.java, ivm.java)
-        val suggestions = listOf(
-            "✦ Create image" to "Generate a creative high-definition illustration of a cybernetic fox in neon city",
-            "📄 Summarize text" to "Summarize the key takeaways and actionable points of modern quantum computing",
-            "💻 Code in Kotlin" to "Write a clean Kotlin coroutine pipeline with Flow and StateFlow error handling",
-            "✍️ Help me write" to "Draft a polite and persuasive proposal for implementing local on-device AI",
-            "🌐 Search web" to "What are the latest breakthroughs in open-source generative AI this week?"
-        )
-
-        LazyRow(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 6.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            contentPadding = PaddingValues(horizontal = 2.dp)
-        ) {
-            items(suggestions) { (label, prompt) ->
-                Surface(
-                    shape = RoundedCornerShape(20.dp),
-                    color = Color(0xFF212121),
-                    border = BorderStroke(1.dp, Color(0xFF323232)),
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(20.dp))
-                        .clickable {
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            onPromptSelected(prompt)
-                        }
-                ) {
-                    Text(
-                        text = label,
-                        style = MaterialTheme.typography.bodyMedium.copy(
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Medium
-                        ),
-                        color = Color(0xFFECECEC),
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
-                    )
-                }
-            }
-        }
-    }
+    ChatWelcome(onPromptSelected = onPromptSelected, modifier = modifier)
 }
 
 @Composable
@@ -2205,6 +2110,7 @@ fun BackendBadge(engineState: EngineState) {
 @Composable
 fun MessageBubble(
     message: ChatMessage,
+    isLatest: Boolean = true,
     isSpeaking: Boolean = false,
     onSpeak: (String, String) -> Unit = { _, _ -> },
     onShare: (String) -> Unit = {},
@@ -2369,7 +2275,7 @@ fun MessageBubble(
             }
 
             // Autonomous tool execution indicator
-            if (message.isExecutingTool) {
+            if (message.isExecutingTool && !message.isSearchingWeb) {
                 Surface(
                     shape = RoundedCornerShape(16.dp),
                     color = Color(0xFF1C1C20),
@@ -2409,7 +2315,7 @@ fun MessageBubble(
 
             // ChatGPT "Searched N sites" collapsible accordion (matching media_1791402016025.jpg)
             if (message.isSearchingWeb) {
-                ChatGptSearchingWebPill()
+                WebSearchActivity(message.toolExecutionStatus ?: "Searching the web")
                 Spacer(modifier = Modifier.height(10.dp))
             } else if (message.searchResults.isNotEmpty()) {
                 ChatGptSearchedSitesPill(
@@ -2417,6 +2323,15 @@ fun MessageBubble(
                     onClick = { showSourcesSheet = true }
                 )
                 Spacer(modifier = Modifier.height(10.dp))
+            }
+
+            if (message.webSearchFailed && isLatest && !message.isStreaming) {
+                OutlinedButton(onClick = onRegenerate, modifier = Modifier.heightIn(min = 48.dp)) {
+                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Retry web search")
+                }
+                Spacer(Modifier.height(8.dp))
             }
 
             // ChatGPT / Perplexity Style Images Carousel for visual and image search queries
@@ -5197,6 +5112,12 @@ private fun ChatInputDock(
             }
         }
 
+        AnimatedVisibility(visible = composerStatus != null) {
+            Text(composerStatus.orEmpty(), color = Color(0xFF9B9B9B),
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp))
+        }
+
         // Floating ChatGPT style Input Bar
         ChatInputBar(
             inputText = inputText,
@@ -5291,28 +5212,19 @@ fun ChatInputBar(
     }
 
     BoxWithConstraints(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.widthIn(max = 840.dp).fillMaxWidth().padding(horizontal = 12.dp),
         contentAlignment = Alignment.Center
     ) {
         val totalWidthPx = constraints.maxWidth
 
-        // Dynamic Width Expansion: 80% width when idle/unfocused/keyboard closed, 95% width when focused/typing (ChatGPT style)
-        val isFocusedOrActive = isFocused || isKeyboardOpen || isMaximized || attachedDocument != null || showAttachmentMenu
-        val targetWidthFraction = if (isFocusedOrActive) 0.95f else 0.80f
-        val animatedWidthFraction by animateFloatAsState(
-            targetValue = targetWidthFraction,
-            animationSpec = spring(
-                dampingRatio = 0.82f,
-                stiffness = Spring.StiffnessMediumLow
-            ),
-            label = "inputWidthFraction"
-        )
+        // Keep the composer stable as the keyboard opens; animate height and controls only.
+        val animatedWidthFraction = 1f
 
         // Threshold width for single-line text field:
         val singleLineTextMaxWidthPx = remember(totalWidthPx, density, isWebSearchEnabled, animatedWidthFraction) {
             with(density) {
                 val currentWidthPx = (totalWidthPx * animatedWidthFraction).toInt()
-                val reservedDp = 24.dp + 42.dp + 42.dp + 8.dp + (if (isWebSearchEnabled) 75.dp else 0.dp)
+                val reservedDp = 24.dp + 48.dp + 48.dp + 8.dp + (if (isWebSearchEnabled) 75.dp else 0.dp)
                 val calculated = currentWidthPx - reservedDp.roundToPx()
                 calculated.coerceAtLeast(140.dp.roundToPx())
             }
@@ -5331,8 +5243,8 @@ fun ChatInputBar(
 
         var isMultiLineState by remember { mutableStateOf(false) }
 
-        val isMultiLine = remember(inputText, attachedDocument, isMaximized, singleLineTextMaxWidthPx) {
-            if (isMaximized || attachedDocument != null || inputText.contains('\n')) {
+        val isMultiLine = remember(inputText, attachedDocument, isMaximized, isWebSearchEnabled, singleLineTextMaxWidthPx) {
+            if (isMaximized || isWebSearchEnabled || attachedDocument != null || inputText.contains('\n')) {
                 isMultiLineState = true
                 true
             } else if (inputText.isEmpty()) {
@@ -5385,8 +5297,8 @@ fun ChatInputBar(
         // Solid ChatGPT Dark Bottom Input Bar Container (ytc.C: #FF212121 surface, #FF323232 border)
         Surface(
             shape = RoundedCornerShape(cornerRadius),
-            color = Color(0xFF212121),
-            border = BorderStroke(1.dp, Color(0xFF323232)),
+            color = LocalChatTheme.current.surface,
+            border = BorderStroke(1.dp, LocalChatTheme.current.border),
             shadowElevation = 4.dp,
             modifier = Modifier
                 .fillMaxWidth(animatedWidthFraction)
@@ -5577,9 +5489,9 @@ fun ChatInputBar(
                                 if (inputText.isEmpty()) {
                                     Text(
                                         text = when {
-                                            isWebSearchEnabled -> "Search"
+                                            isWebSearchEnabled -> "Search the web…"
                                             hasAttachment -> "Ask about this..."
-                                            else -> "Message"
+                                            else -> "Ask Gemma…"
                                         },
                                         style = MaterialTheme.typography.bodyMedium.copy(
                                             fontSize = 16.sp,
@@ -5599,7 +5511,7 @@ fun ChatInputBar(
                     onClick = onAttach,
                     shape = CircleShape,
                     color = Color.Transparent,
-                    modifier = Modifier.size(38.dp)
+                    modifier = Modifier.size(48.dp)
                 ) {
                     Icon(
                         imageVector = Icons.Default.Add,
@@ -5648,7 +5560,7 @@ fun ChatInputBar(
                             onClick = onVoiceInput,
                             shape = CircleShape,
                             color = Color.Transparent,
-                            modifier = Modifier.size(38.dp)
+                            modifier = Modifier.size(48.dp)
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Mic,
@@ -5692,7 +5604,7 @@ fun ChatInputBar(
                                     onClick = onStop,
                                     shape = CircleShape,
                                     color = Color(0xFFFA70AB),
-                                    modifier = Modifier.size(38.dp)
+                                    modifier = Modifier.size(48.dp)
                                 ) {
                                     Icon(
                                         painter = painterResource(id = R.drawable.ic_chatgpt_stop),
@@ -5710,7 +5622,7 @@ fun ChatInputBar(
                                     enabled = canSend,
                                     shape = CircleShape,
                                     color = if (canSend) Color(0xFFFA70AB) else Color(0xFF383838),
-                                    modifier = Modifier.size(38.dp)
+                                    modifier = Modifier.size(48.dp)
                                 ) {
                                     Icon(
                                         painter = painterResource(id = R.drawable.ic_chatgpt_send),
@@ -5726,7 +5638,7 @@ fun ChatInputBar(
                                     onClick = onVoiceAssistant,
                                     shape = CircleShape,
                                     color = Color(0xFFFA70AB),
-                                    modifier = Modifier.size(38.dp)
+                                    modifier = Modifier.size(48.dp)
                                 ) {
                                     Icon(
                                         painter = painterResource(id = R.drawable.ic_chatgpt_voice),
@@ -5807,7 +5719,7 @@ fun ChatInputBar(
                                 onClick = onStop,
                                 shape = CircleShape,
                                 color = Color(0xFFFA70AB),
-                                modifier = Modifier.size(38.dp)
+                                modifier = Modifier.size(48.dp)
                             ) {
                                 Icon(
                                     painter = painterResource(id = R.drawable.ic_chatgpt_stop),
@@ -5823,7 +5735,7 @@ fun ChatInputBar(
                                 enabled = canSend,
                                 shape = CircleShape,
                                 color = if (canSend) Color(0xFFFA70AB) else Color(0xFF383838),
-                                modifier = Modifier.size(38.dp)
+                                modifier = Modifier.size(48.dp)
                             ) {
                                 Icon(
                                     painter = painterResource(id = R.drawable.ic_chatgpt_send),

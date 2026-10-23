@@ -331,8 +331,8 @@ private fun TextBlockView(
     codeBgColor: Color,
     searchResults: List<SearchResult> = emptyList()
 ) {
-    val cacheKey = remember(content, textColor, linkColor, codeBgColor, searchResults.size) {
-        "v3|$content|${textColor.value}|${linkColor.value}|${codeBgColor.value}|${searchResults.size}"
+    val cacheKey = remember(content, textColor, linkColor, codeBgColor, searchResults) {
+        "v3|$content|${textColor.value}|${linkColor.value}|${codeBgColor.value}|${searchResults.hashCode()}"
     }
     val parsedLines = remember(cacheKey) {
         val cached = renderedLineCache.get(cacheKey)
@@ -2064,78 +2064,30 @@ fun sanitizeMarkdown(input: String, searchResults: List<SearchResult> = emptyLis
         // 4c. Normalize (1), (2) at sentence ends or before punctuation
         s = s.replace(Regex("""(?<=\w)\s*\(([1-9])\)(?=\s*[.,\n]|$)""")) { " [${it.groupValues[1]}]" }
 
-        // 4d. Map numeric citation references like [1], [2], [1, 2] to individual sleek website citation pills
-        val numCitationRegex = Regex("""\[([0-9]+(?:\s*,\s*[0-9]+)*)\]""")
+        // Each citation keeps its own exact URL, even when several sources share a host.
+        val numCitationRegex = Regex("""\[([0-9]+(?:\s*,\s*[0-9]+)*)\](?!\()""")
         s = s.replace(numCitationRegex) { match ->
-            val numStr = match.groupValues[1].trim()
-            val indices = numStr.split(",").mapNotNull { it.trim().toIntOrNull() }
-            if (indices.isEmpty()) {
-                match.value
-            } else {
-                val primaryIdx = indices.first()
-                val res = searchResults.getOrNull(primaryIdx - 1)
-                if (res != null) {
-                    val (brand, _) = getSourceBrand(res.url, res.title)
-                    val extraCount = indices.size - 1
-                    "[citation:$brand:$extraCount](${res.url})"
-                } else match.value
-            }
+            match.groupValues[1].split(",").mapNotNull { it.trim().toIntOrNull() }
+                .distinct().joinToString(" ") { index ->
+                    val source = searchResults.getOrNull(index - 1)
+                    if (source == null) "[source unavailable]" else {
+                        val (brand, _) = getSourceBrand(source.url, source.title)
+                        "[citation:$brand:0](${source.url})"
+                    }
+                }
         }
-
-        // 4e. Ground bare domain citations in brackets, e.g. [in.linkedin.com] -> [citation:LinkedIn:0](url)
-        for (res in searchResults) {
-            val (brand, _) = getSourceBrand(res.url, res.title)
-            val label = getWebsiteCitationLabel(res.url, res.title)
-            val bareRegex = Regex("""\[${Regex.escape(label)}\](?!\()""", RegexOption.IGNORE_CASE)
-            s = s.replace(bareRegex, "[citation:$brand:0](${res.url})")
-            val rootDomain = label.substringAfter(".")
-            if (rootDomain.contains(".")) {
-                val bareRoot = Regex("""\[${Regex.escape(rootDomain)}\](?!\()""", RegexOption.IGNORE_CASE)
-                s = s.replace(bareRoot, "[citation:$brand:0](${res.url})")
-            }
-            val bareBrand = Regex("""\[${Regex.escape(brand)}\](?!\()""", RegexOption.IGNORE_CASE)
-            s = s.replace(bareBrand, "[citation:$brand:0](${res.url})")
-        }
-
-        // 5. Ground markdown links [Title](url) to real URLs from searchResults ONLY when strictly matched
+        // Never repair an invented article URL by redirecting it to another page on that domain.
         val markdownLinkRegex = Regex("""\[([^\]]+)\]\((https?://[^\s)]+)\)""")
         s = s.replace(markdownLinkRegex) { match ->
-            val linkText = match.groupValues[1].trim()
-            val generatedUrl = match.groupValues[2].trim()
-
-            if (linkText.startsWith("citation:")) {
-                return@replace match.value
-            }
-
-            val matchedResult = searchResults.firstOrNull { res ->
-                val resHost = try { java.net.URI(res.url).host?.removePrefix("www.")?.lowercase() } catch (_: Exception) { null }
-                val genHost = try { java.net.URI(generatedUrl).host?.removePrefix("www.")?.lowercase() } catch (_: Exception) { null }
-
-                (genHost != null && resHost != null && (genHost == resHost || genHost.endsWith(".$resHost") || resHost.endsWith(".$genHost"))) ||
-                (linkText.contains("linkedin", ignoreCase = true) && res.url.contains("linkedin", ignoreCase = true)) ||
-                (linkText.contains("github", ignoreCase = true) && res.url.contains("github", ignoreCase = true)) ||
-                (linkText.contains("hugging", ignoreCase = true) && res.url.contains("huggingface", ignoreCase = true)) ||
-                (linkText.contains("wikipedia", ignoreCase = true) && res.url.contains("wikipedia", ignoreCase = true))
-            }
-
-            if (matchedResult != null) {
-                val (brand, _) = getSourceBrand(matchedResult.url, matchedResult.title)
-                "[citation:$brand:0](${matchedResult.url})"
+            val label = match.groupValues[1]
+            val url = match.groupValues[2]
+            val source = searchResults.firstOrNull { it.url == url }
+            if (source == null) {
+                "${if (label.startsWith("citation:")) "Source" else label} (unverified link)"
             } else {
-                "[$linkText]($generatedUrl)"
+                val (brand, _) = getSourceBrand(source.url, source.title)
+                "[citation:$brand:0](${source.url})"
             }
-        }
-
-        // 6. Ground raw URLs to matching searchResults domains so users never navigate to fake URLs
-        val rawUrlRegex = Regex("""https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/[^\s\)\],<]*)?""")
-        s = s.replace(rawUrlRegex) { match ->
-            val rawUrl = match.value
-            val matched = searchResults.firstOrNull { res ->
-                val resHost = try { java.net.URI(res.url).host?.removePrefix("www.")?.lowercase() } catch (_: Exception) { null }
-                val rawHost = try { java.net.URI(rawUrl).host?.removePrefix("www.")?.lowercase() } catch (_: Exception) { null }
-                resHost != null && rawHost != null && (resHost == rawHost || resHost.endsWith(".$rawHost") || rawHost.endsWith(".$resHost"))
-            }
-            matched?.url ?: rawUrl
         }
     }
 

@@ -17,6 +17,58 @@ class SearchManagerTest {
     }
 
     @Test
+    fun cacheHonorsResultLimitAndExplicitRefresh() = runBlocking {
+        var calls = 0
+        val manager = SearchManager(
+            webSearchClient = object : WebSearchClient() {
+                override suspend fun search(query: String, maxResults: Int): List<SearchResult> {
+                    calls++
+                    return (1..5).map { SearchResult("Phone $it", "https://shop$it.example/phone", "Phone details") }
+                }
+            },
+            serpApiClient = SerpApiClient(""), serperClient = SerperClient("")
+        )
+        manager.searchAndReadWithStatus("phone", maxResults = 1, isProduct = true)
+        manager.searchAndReadWithStatus("phone", maxResults = 1, isProduct = true)
+        assertEquals(1, calls)
+        val expanded = manager.searchAndReadWithStatus("phone", maxResults = 5, isProduct = true)
+        assertEquals(2, calls)
+        assertEquals(5, expanded.results.size)
+        repeat(2) { manager.searchAndReadWithStatus("refresh phone", isProduct = true) }
+        assertEquals(4, calls)
+    }
+
+    @Test
+    fun contextBudgetIncludesEverySourceAndClosesBoundary() {
+        val results = (1..5).map { index ->
+            EnrichedSearchResult("Source $index", "https://example.com/$index", "snippet",
+                "long content ".repeat(500), true)
+        }
+        val context = SearchManager().formatGemmaWebContext(results, 5000)
+        assertTrue(context.length <= 5000)
+        assertTrue(context.contains("[5] Title:"))
+        assertTrue(context.endsWith("</WEB_SOURCE_UNTRUSTED_DATA>"))
+    }
+
+    @Test
+    fun cancellationIsNotReportedAsProviderFailure() = runBlocking {
+        val manager = SearchManager(
+            webSearchClient = object : WebSearchClient() {
+                override suspend fun search(query: String, maxResults: Int): List<SearchResult> {
+                    throw kotlinx.coroutines.CancellationException("Stopped")
+                }
+            },
+            serpApiClient = SerpApiClient(""), serperClient = SerperClient("")
+        )
+        try {
+            manager.searchAndReadWithStatus("cancel query")
+            org.junit.Assert.fail("Cancellation must propagate")
+        } catch (_: kotlinx.coroutines.CancellationException) {
+            // Expected: Stop must not produce a provider error or a fallback answer.
+        }
+    }
+
+    @Test
     fun testNormalizeUrl_stripsTrackingParamsAndStandardizes() {
         val raw = "https://example.com/article/?utm_source=twitter&utm_medium=social&fbclid=IwAR234&id=99"
         val normalized = searchManager.normalizeUrl(raw)
@@ -181,7 +233,7 @@ class SearchManagerTest {
     }
 
     @Test
-    fun testSearchAndReadWithStatus_nonProductDoesNotUseSerperOrSerpApi() = runBlocking {
+    fun testSearchAndReadWithStatus_generalSearchFallsBackWhenProvidersReturnEmpty() = runBlocking {
         var serperCalled = false
         var serpApiCalled = false
 
@@ -207,6 +259,9 @@ class SearchManagerTest {
 
         val manager = SearchManager(
             webSearchClient = mockWebClient,
+            webPageFetcher = object : WebPageFetcher() {
+                override suspend fun fetchPage(urlString: String) = FetchedPage(urlString, "", false)
+            },
             serperClient = mockSerper,
             serpApiClient = mockSerp
         )
@@ -214,8 +269,8 @@ class SearchManagerTest {
         val response = manager.searchAndReadWithStatus("tell me about India history", maxResults = 5, isProduct = false)
 
         assertEquals(SearchStatus.SUCCESS, response.status)
-        assertFalse("Serper must NOT be called for non-product general searches!", serperCalled)
-        assertFalse("SerpApi must NOT be called for non-product general searches!", serpApiCalled)
+        assertTrue("Configured Serper should be attempted for general searches", serperCalled)
+        assertTrue("Configured SerpApi should be attempted after Serper returns empty", serpApiCalled)
         assertEquals("Free Wikipedia Article", response.results[0].title)
     }
 

@@ -10,6 +10,21 @@ import org.junit.Test
 class MarkdownTextTest {
 
     @Test
+    fun citationsKeepDistinctPagesOnSameDomain() {
+        val results = listOf(
+            com.teja.gemmmobile.search.SearchResult("First", "https://example.com/one", "One"),
+            com.teja.gemmmobile.search.SearchResult("Second", "https://example.com/two", "Two")
+        )
+        val output = sanitizeMarkdown("Evidence [1, 2]", results)
+        assertTrue(output.contains("https://example.com/one"))
+        assertTrue(output.contains("https://example.com/two"))
+        val invented = sanitizeMarkdown("[Other](https://example.com/invented)", results)
+        assertTrue(invented.contains("unverified link"))
+        assertTrue(!invented.contains("https://example.com/one"))
+        assertTrue(!invented.contains("https://example.com/invented"))
+    }
+
+    @Test
     fun testSanitizeMathArtifacts() {
         val raw = "The answer is \$\\text{Gemma 4}\$ and \$\\mathrm{LiteRT}\$ with (\$\\text{fast}\$)."
         val sanitized = sanitizeMarkdown(raw)
